@@ -1,332 +1,341 @@
-import { useState, useCallback } from 'react'
-import { useSessionStore } from '../../stores/sessionStore'
-import { useAppStore } from '../../stores/appStore'
-import { db } from '../../db/database'
-import { evaluateResponse } from '../../services/gemini'
-import type { EvaluationResult } from '../../services/gemini'
-import { formatTime } from '../../utils/helpers'
-import type { BlockResponse } from '../../types'/**
- * PostSession — Shown after a session completes.
- *
- * Phases:
- * 1. Review all responses (editable text before evaluation)
- * 2. "Evaluate" action — sends each block through Gemini
- * 3. Feedback view — per-block AI scores + strengths/weaknesses
- */
-export function PostSession() {
-  const activeRun = useSessionStore((s) => s.activeRun)
-  const setView = useAppStore((s) => s.setView)
+import { useState, useCallback, useEffect } from 'react';
+import { useSessionStore } from '../../stores/sessionStore';
+import { useAppStore } from '../../stores/appStore';
+import { db } from '../../db/database';
+import { evaluateResponse } from '../../services/gemini';
+import { formatTime } from '../../utils/helpers';
+import type { BlockResponse, DETSkill } from '../../types';
 
-  const [evaluating, setEvaluating] = useState(false)
-  const [evalError, setEvalError] = useState<string | null>(null)
+export function PostSession() {
+  const activeRun = useSessionStore((s) => s.activeRun);
+  const clearActiveRun = useSessionStore((s) => s.clearActiveRun);
+  const setView = useAppStore((s) => s.setView);
+  const setConfigSection = useAppStore((s) => s.setConfigSection);
+
+  const [evaluating, setEvaluating] = useState(false);
+  const [evalError, setEvalError] = useState<string | null>(null);
+  const [queuedOffline, setQueuedOffline] = useState(false);
   const [localResponses, setLocalResponses] = useState<Record<string, BlockResponse>>(
     activeRun?.responses ?? {}
-  )
+  );
 
   const handleUpdateText = (blockId: string, text: string) => {
     setLocalResponses((prev) => ({
       ...prev,
       [blockId]: { ...prev[blockId], textOrTranscript: text },
-    }))
-  }
+    }));
+  };
 
   const handleEvaluate = useCallback(async () => {
-    if (!activeRun) return
-    setEvaluating(true)
-    setEvalError(null)
+    if (!activeRun) return;
+
+    if (!navigator.onLine) {
+      setQueuedOffline(true);
+      setEvalError('You are currently offline. Responses are saved and will auto-evaluate when back online.');
+      return;
+    }
+
+    setEvaluating(true);
+    setEvalError(null);
 
     try {
-      // Load settings for API key
-      const settings = await db.settings.get('app-settings')
+      const settings = await db.settings.get('app-settings');
       if (!settings?.geminiApiKey) {
-        setEvalError(
-          'Gemini API key not set. Go to Config → Settings to add your key.'
-        )
-        setEvaluating(false)
-        return
+        setEvalError('Gemini API key not set. Go to Config -> Settings to paste your free Google AI Studio key.');
+        setEvaluating(false);
+        return;
       }
 
-      // Load eval prompts
-      const evalPrompts = await db.evalPrompts.toArray()
-
-      const updatedResponses = { ...localResponses }
+      const evalPrompts = await db.evalPrompts.toArray();
+      const updatedResponses = { ...localResponses };
+      const blockScores: number[] = [];
+      const skillScores: Partial<Record<DETSkill, number[]>> = {};
 
       for (const block of activeRun.blockConfigs) {
-        const response = localResponses[block.id]
-        if (!response?.textOrTranscript && !response?.audioBlobRef) continue
+        const response = updatedResponses[block.id];
+        const text = response?.textOrTranscript?.trim() ?? '';
+        if (!text) continue;
 
-        // Find the matching eval prompt
-        const evalPrompt = evalPrompts.find((ep) => ep.appliesToType === block.type)
-        if (!evalPrompt) continue
+        const evalPrompt =
+          evalPrompts.find((ep) => ep.id === block.evalPromptId) ??
+          evalPrompts.find((ep) => ep.appliesToType === block.type) ??
+          evalPrompts[0];
 
-        const variables: Record<string, string> = {
-          prompt: block.instructions,
-          response: response.textOrTranscript ?? '',
-          transcript: response.textOrTranscript ?? '',
-          durationSec: String(response.timeSpentSec ?? 0),
-        }
+        if (!evalPrompt) continue;
 
-        try {
-          const feedback: EvaluationResult = await evaluateResponse({
-            apiKey: settings.geminiApiKey,
-            evalPromptTemplate: evalPrompt.promptText,
-            variables,
-          })
+        const feedback = await evaluateResponse({
+          apiKey: settings.geminiApiKey,
+          evalPromptTemplate: evalPrompt.promptText,
+          variables: {
+            prompt: response?.promptSnapshot || block.instructions,
+            response: text,
+            transcript: text,
+            durationSec: String(response?.timeSpentSec ?? block.durationSec),
+          },
+        });
 
-          const overallScore =
-            typeof feedback.criteria === 'object'
-              ? Math.round(
-                  Object.values(feedback.criteria as Record<string, number>)
-                    .filter((v): v is number => typeof v === 'number')
-                    .reduce((a, b) => a + b, 0) /
-                    Math.max(1, Object.keys(feedback.criteria).length)
-                )
-              : feedback.subscore
+        const subVals = Object.values(feedback.subscores);
+        const computedScore =
+          feedback.overallScore ??
+          (subVals.length > 0
+            ? Math.round(subVals.reduce((a, b) => a + b, 0) / subVals.length)
+            : 125);
 
-          updatedResponses[block.id] = {
-            ...response,
-            aiFeedback: {
-              subscores: feedback.criteria as Record<string, number>,
-              criteria: {},
-              strengths: feedback.strengths,
-              weaknesses: feedback.weaknesses,
-              suggestions: feedback.suggestions,
-              note: feedback.note,
-            },
-            aiOverallScore: overallScore,
-            aiSubscores: feedback.criteria as Record<string, number>,
-          }
-        } catch (blockErr) {
-          console.error(`Failed to evaluate block ${block.name}:`, blockErr)
-          // Continue with other blocks — don't fail the whole batch
+        blockScores.push(computedScore);
+
+        const targetSkill: DETSkill =
+          block.type === 'speaking'
+            ? 'speaking'
+            : block.type === 'mock-test'
+            ? 'reading'
+            : 'writing';
+        skillScores[targetSkill] = [...(skillScores[targetSkill] ?? []), computedScore];
+
+        updatedResponses[block.id] = {
+          ...response,
+          aiFeedback: feedback,
+          aiOverallScore: computedScore,
+          aiSubscores: feedback.subscores,
+          evalPendingOffline: false,
+        };
+      }
+
+      const compositeOverall =
+        blockScores.length > 0
+          ? Math.round(blockScores.reduce((a, b) => a + b, 0) / blockScores.length)
+          : undefined;
+
+      const perSkillScores: Partial<Record<DETSkill, number>> = {};
+      for (const [sk, arr] of Object.entries(skillScores) as [DETSkill, number[]][]) {
+        if (arr && arr.length > 0) {
+          perSkillScores[sk] = Math.round(arr.reduce((a, b) => a + b, 0) / arr.length);
         }
       }
 
-      setLocalResponses(updatedResponses)
-
-      // Persist evaluated responses
-      await db.sessionRuns.update(activeRun.id, { responses: updatedResponses })
+      setLocalResponses(updatedResponses);
+      await db.sessionRuns.update(activeRun.id, {
+        responses: updatedResponses,
+        summary: {
+          overallScore: compositeOverall,
+          perSkillScores,
+          durationSec: activeRun.overallElapsedSec,
+        },
+      });
+      setQueuedOffline(false);
     } catch (err) {
       setEvalError(
-        err instanceof Error ? err.message : 'Evaluation failed. Check your API key and try again.'
-      )
+        err instanceof Error ? err.message : 'Evaluation failed. Check your Gemini API key.'
+      );
     } finally {
-      setEvaluating(false)
+      setEvaluating(false);
     }
-  }, [activeRun, localResponses])
+  }, [activeRun, localResponses]);
 
-  if (!activeRun) return null
+  // Auto-evaluate when connection is restored if queued offline
+  useEffect(() => {
+    if (!queuedOffline) return;
+    const onOnline = () => {
+      void handleEvaluate();
+    };
+    window.addEventListener('online', onOnline);
+    return () => window.removeEventListener('online', onOnline);
+  }, [queuedOffline, handleEvaluate]);
 
-  const hasAnyFeedback = Object.values(localResponses).some((r) => r.aiFeedback)
-  const totalTime = activeRun.overallElapsedSec
+  if (!activeRun) return null;
+
+  const scoredValues = Object.values(localResponses)
+    .map((r) => r.aiOverallScore)
+    .filter((v): v is number => typeof v === 'number');
+  const sessionAverage =
+    scoredValues.length > 0
+      ? Math.round(scoredValues.reduce((a, b) => a + b, 0) / scoredValues.length)
+      : null;
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-10">
-      {/* Header */}
-      <div className="mb-8">
-        <div className="flex items-center gap-2 mb-2">
-          <span className="text-3xl">🎉</span>
-          <h2 className="text-2xl font-bold text-slate-900">Session Complete!</h2>
-        </div>
-        <p className="text-slate-500">
-          {activeRun.templateName} · {formatTime(totalTime)} ·{' '}
-          {activeRun.blockConfigs.length} blocks
-        </p>
-      </div>
-
-      {/* Evaluate CTA */}
-      {!hasAnyFeedback && (
-        <div className="mb-8 bg-primary-50 border border-primary-200 rounded-xl p-5">
-          <h3 className="font-semibold text-primary-800 mb-2">🤖 AI Evaluation</h3>
-          <p className="text-sm text-primary-700 mb-4">
-            Send your responses to Gemini for scored feedback against the DET 0–160 scale.
-            Review and edit your responses below before submitting.
+      {/* Header Banner */}
+      <div className="bg-white border border-slate-200 rounded-2xl p-6 mb-8 flex flex-wrap items-center justify-between gap-4 shadow-xs">
+        <div>
+          <span className="text-xs font-bold uppercase tracking-wider text-primary-600">
+            Session Complete
+          </span>
+          <h2 className="text-2xl font-bold text-slate-900 mt-0.5">{activeRun.templateName}</h2>
+          <p className="text-xs text-slate-500 mt-1">
+            Total Time: {formatTime(activeRun.overallElapsedSec)} • {activeRun.blockConfigs.length} Blocks
           </p>
-          {evalError && (
-            <div className="mb-3 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg p-3">
-              {evalError}
-            </div>
-          )}
+        </div>
+
+        {sessionAverage !== null ? (
+          <div className="text-right bg-primary-50 border border-primary-200 px-5 py-3 rounded-xl">
+            <span className="text-xs font-semibold text-primary-700 block">Estimated DET Band</span>
+            <span className="text-4xl font-black text-primary-600">{sessionAverage}</span>
+            <span className="text-xs text-primary-600"> / 160 (Target: 140–150)</span>
+          </div>
+        ) : (
           <button
             onClick={handleEvaluate}
             disabled={evaluating}
-            className="px-5 py-2.5 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 disabled:opacity-50 transition-colors"
+            className="px-6 py-3 bg-primary-600 text-white text-sm font-bold rounded-xl hover:bg-primary-700 disabled:opacity-50 cursor-pointer shadow-sm"
           >
-            {evaluating ? '⏳ Evaluating…' : '✨ Evaluate with AI'}
+            {evaluating ? '⏳ Grading with Gemini...' : '✨ Grade All Blocks with Gemini AI'}
           </button>
+        )}
+      </div>
+
+      {evalError && (
+        <div className="mb-6 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl p-4">
+          {evalError}
         </div>
       )}
 
-      {/* Per-block review */}
+      {/* Per-block review cards */}
       <div className="space-y-6">
         {activeRun.blockConfigs.map((block, idx) => {
-          const response = localResponses[block.id]
-          const feedback = response?.aiFeedback
-          const score = response?.aiOverallScore
+          const response = localResponses[block.id];
+          const feedback = response?.aiFeedback;
+          const score = response?.aiOverallScore;
 
           return (
-            <div key={block.id} className="bg-white rounded-xl border border-slate-200">
-              {/* Block header */}
-              <div className="flex items-center gap-3 p-4 border-b border-slate-100">
-                <span className="w-7 h-7 rounded-full bg-slate-100 text-slate-600 text-xs flex items-center justify-center font-bold">
-                  {idx + 1}
-                </span>
-                <div className="flex-1">
-                  <h3 className="font-semibold text-slate-900">{block.name}</h3>
-                  <p className="text-xs text-slate-400">{block.type}</p>
+            <div key={block.id} className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+              <div className="flex items-center justify-between p-4 bg-slate-50 border-b border-slate-100">
+                <div className="flex items-center gap-3">
+                  <span className="w-7 h-7 rounded-full bg-slate-200 text-slate-700 text-xs flex items-center justify-center font-bold">
+                    {idx + 1}
+                  </span>
+                  <div>
+                    <h3 className="font-semibold text-slate-900">{block.name}</h3>
+                    <p className="text-xs text-slate-500">
+                      {block.type} • {formatTime(response?.timeSpentSec ?? 0)} spent
+                      {response?.wpm ? ` • ${response.wpm} WPM` : ''}
+                      {response?.fillerCount !== undefined ? ` • ${response.fillerCount} fillers` : ''}
+                    </p>
+                  </div>
                 </div>
                 {score !== undefined && (
                   <div className="text-right">
                     <span className="text-2xl font-black text-primary-600">{score}</span>
-                    <span className="text-xs text-slate-400 block">/160</span>
+                    <span className="text-xs text-slate-400 block">/ 160</span>
                   </div>
                 )}
               </div>
 
-              <div className="p-4 space-y-4">
-                {/* Response text — editable before eval */}
-                {!feedback && (
-                  <div>
-                    <label className="block text-xs font-medium text-slate-500 mb-1">
-                      Your Response
-                      {!hasAnyFeedback && (
-                        <span className="ml-1 text-slate-400">(editable before evaluation)</span>
-                      )}
-                    </label>
-                    {hasAnyFeedback ? (
-                      <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap bg-slate-50 rounded-lg p-3">
-                        {response?.textOrTranscript || <em className="text-slate-400">No response</em>}
-                      </p>
-                    ) : (
-                      <textarea
-                        value={response?.textOrTranscript ?? ''}
-                        onChange={(e) => handleUpdateText(block.id, e.target.value)}
-                        rows={4}
-                        className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-700 resize-y focus:outline-none focus:ring-2 focus:ring-primary-400"
-                      />
-                    )}
-                  </div>
-                )}
-
-                {/* Audio playback */}
+              <div className="p-5 space-y-4">
                 {response?.audioBlobRef && (
                   <div>
                     <label className="block text-xs font-medium text-slate-500 mb-1">
-                      Audio Recording
+                      Recorded Audio
                     </label>
-                    <audio controls src={response.audioBlobRef} className="w-full" />
+                    <audio controls src={response.audioBlobRef} className="w-full h-10" />
                   </div>
                 )}
 
-                {/* AI Feedback */}
-                {feedback && (
-                  <div className="space-y-3">
-                    {/* Response text (read-only after eval) */}
-                    <div>
-                      <p className="text-xs font-medium text-slate-500 mb-1">Your Response</p>
-                      <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap bg-slate-50 rounded-lg p-3">
-                        {response?.textOrTranscript || <em className="text-slate-400">No text response</em>}
-                      </p>
-                    </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 mb-1">
+                    Your Response / Verbatim Transcript (Editable before re-evaluating):
+                  </label>
+                  <textarea
+                    value={response?.textOrTranscript ?? ''}
+                    onChange={(e) => handleUpdateText(block.id, e.target.value)}
+                    rows={4}
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-primary-400"
+                  />
+                </div>
 
-                    {/* Subscores */}
-                    {feedback.subscores && Object.keys(feedback.subscores).length > 0 && (
-                      <div>
-                        <p className="text-xs font-medium text-slate-500 mb-2">Criteria Scores</p>
-                        <div className="grid grid-cols-2 gap-2">
-                          {Object.entries(feedback.subscores).map(([key, val]) => (
-                            <div key={key} className="bg-slate-50 rounded-lg p-2.5">
-                              <p className="text-xs text-slate-500 capitalize">{key.replace(/_/g, ' ')}</p>
-                              <p className="text-lg font-bold text-primary-600">{val}</p>
-                            </div>
-                          ))}
-                        </div>
+                {feedback && (
+                  <div className="space-y-4 pt-2 border-t border-slate-100">
+                    {Object.keys(feedback.subscores).length > 0 && (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        {Object.entries(feedback.subscores).map(([key, val]) => (
+                          <div key={key} className="bg-slate-50 rounded-lg p-2.5 border border-slate-100">
+                            <p className="text-xs text-slate-500 capitalize">{key.replace(/_/g, ' ')}</p>
+                            <p className="text-lg font-bold text-primary-600">{val}</p>
+                          </div>
+                        ))}
                       </div>
                     )}
 
-                    {/* Strengths / Weaknesses / Suggestions */}
-                    <div className="grid grid-cols-1 gap-3">
-                      {feedback.strengths?.length > 0 && (
-                        <FeedbackList title="✅ Strengths" items={feedback.strengths} color="green" />
+                    {feedback.suggestedFix && (
+                      <div className="bg-primary-50 border border-primary-200 rounded-xl p-3.5">
+                        <p className="text-xs font-bold text-primary-800 mb-1">
+                          ✨ 145–155 Band Suggested Upgrade
+                        </p>
+                        <p className="text-xs text-slate-800 leading-relaxed">
+                          {feedback.suggestedFix}
+                        </p>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                      {feedback.strengths.length > 0 && (
+                        <div className="bg-green-50 rounded-lg p-3">
+                          <p className="font-bold text-green-800 mb-1.5">✓ Strengths</p>
+                          <ul className="space-y-1 text-slate-700 list-disc list-inside">
+                            {feedback.strengths.map((s, i) => (
+                              <li key={i}>{s}</li>
+                            ))}
+                          </ul>
+                        </div>
                       )}
-                      {feedback.weaknesses?.length > 0 && (
-                        <FeedbackList title="⚠️ Weaknesses" items={feedback.weaknesses} color="amber" />
+                      {feedback.weaknesses.length > 0 && (
+                        <div className="bg-amber-50 rounded-lg p-3">
+                          <p className="font-bold text-amber-800 mb-1.5">⚠️ Weaknesses</p>
+                          <ul className="space-y-1 text-slate-700 list-disc list-inside">
+                            {feedback.weaknesses.map((w, i) => (
+                              <li key={i}>{w}</li>
+                            ))}
+                          </ul>
+                        </div>
                       )}
-                      {feedback.suggestions?.length > 0 && (
-                        <FeedbackList title="💡 Suggestions" items={feedback.suggestions} color="blue" />
+                      {feedback.suggestions.length > 0 && (
+                        <div className="bg-blue-50 rounded-lg p-3">
+                          <p className="font-bold text-blue-800 mb-1.5">💡 Actionable Fixes</p>
+                          <ul className="space-y-1 text-slate-700 list-disc list-inside">
+                            {feedback.suggestions.map((sg, i) => (
+                              <li key={i}>{sg}</li>
+                            ))}
+                          </ul>
+                        </div>
                       )}
                     </div>
-
-                    {feedback.note && (
-                      <p className="text-xs text-slate-400 italic">{feedback.note}</p>
-                    )}
                   </div>
                 )}
               </div>
             </div>
-          )
+          );
         })}
       </div>
 
-      {/* Re-evaluate option */}
-      {hasAnyFeedback && (
-        <div className="mt-6 flex justify-between items-center">
+      {/* Footer Actions */}
+      <div className="mt-8 flex flex-wrap justify-between items-center gap-3">
+        <button
+          onClick={handleEvaluate}
+          disabled={evaluating}
+          className="px-4 py-2 text-sm font-semibold text-primary-700 bg-primary-50 border border-primary-200 rounded-lg hover:bg-primary-100 disabled:opacity-50"
+        >
+          {evaluating ? 'Re-evaluating...' : '↻ Re-evaluate Responses with AI'}
+        </button>
+
+        <div className="flex gap-3">
           <button
-            onClick={handleEvaluate}
-            disabled={evaluating}
-            className="text-sm text-primary-600 hover:text-primary-700 disabled:opacity-50"
+            onClick={() => {
+              clearActiveRun();
+            }}
+            className="px-4 py-2.5 text-sm font-semibold text-slate-700 border border-slate-300 rounded-lg hover:bg-white"
           >
-            {evaluating ? 'Evaluating…' : '↺ Re-evaluate with AI'}
+            Start Another Session
           </button>
           <button
-            onClick={() => setView('config')}
-            className="px-5 py-2.5 bg-slate-900 text-white text-sm font-semibold rounded-lg hover:bg-slate-800 transition-colors"
+            onClick={() => {
+              clearActiveRun();
+              setConfigSection('history');
+              setView('config');
+            }}
+            className="px-5 py-2.5 bg-slate-900 text-white text-sm font-semibold rounded-lg hover:bg-slate-800"
           >
-            ← Back to Config
+            📊 View Score Trends & History
           </button>
         </div>
-      )}
-
-      {!hasAnyFeedback && (
-        <div className="mt-6 flex justify-end">
-          <button
-            onClick={() => setView('config')}
-            className="text-sm text-slate-500 hover:text-slate-700"
-          >
-            Skip evaluation → Back to Config
-          </button>
-        </div>
-      )}
+      </div>
     </div>
-  )
-}
-
-// ── Helper: feedback list ────────────────────────────────────────────────────
-
-function FeedbackList({
-  title,
-  items,
-  color,
-}: {
-  title: string
-  items: string[]
-  color: 'green' | 'amber' | 'blue'
-}) {
-  const bgMap = { green: 'bg-green-50', amber: 'bg-amber-50', blue: 'bg-blue-50' }
-  const textMap = { green: 'text-green-800', amber: 'text-amber-800', blue: 'text-blue-800' }
-  const dotMap = { green: 'bg-green-400', amber: 'bg-amber-400', blue: 'bg-blue-400' }
-
-  return (
-    <div className={`${bgMap[color]} rounded-lg p-3`}>
-      <p className={`text-xs font-semibold ${textMap[color]} mb-2`}>{title}</p>
-      <ul className="space-y-1">
-        {items.map((item, i) => (
-          <li key={i} className="flex items-start gap-2 text-xs text-slate-700">
-            <span className={`mt-1.5 w-1.5 h-1.5 rounded-full ${dotMap[color]} flex-shrink-0`} />
-            {item}
-          </li>
-        ))}
-      </ul>
-    </div>
-  )
+  );
 }

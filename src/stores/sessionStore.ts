@@ -1,30 +1,20 @@
-/**
- * Session Store — Exam runner state management.
- *
- * Manages the entire lifecycle of a practice session:
- * starting, timing, block transitions, response collection, and DB persistence.
- *
- * Key design decisions:
- * - tick() is called every 1s by an external TimerEngine. It increments time,
- *   checks block expiry, and auto-advances when configured.
- * - persistToDb() is called every 5 ticks (5s) + on every response update.
- * - Transition countdown (3-2-1) is managed here — tick() doesn't increment
- *   real time while a transition is active.
- * - Selector functions (selectXxx) are exported for use with useSessionStore().
- */
-
 import { create } from 'zustand';
 import { v4 as uuidv4 } from 'uuid';
-
 import type {
   SessionTemplate,
   SessionRun,
   BlockConfig,
   BlockResponse,
+  DETQuestionType,
 } from '../types';
 import { db } from '../db';
 
-// ─── State ───────────────────────────────────────────────────────────────────
+export interface StartSessionOptions {
+  selectedBlockIds?: string[];
+  customDurations?: Record<string, number>;
+  instantFeedback?: boolean;
+  preferredQuestionType?: DETQuestionType | 'all' | 'adaptive';
+}
 
 interface SessionState {
   activeRun: SessionRun | null;
@@ -33,18 +23,18 @@ interface SessionState {
   overallElapsedSec: number;
   isRunning: boolean;
   isPaused: boolean;
-  /** 3-2-1 inter-block countdown; null = no transition in progress */
   transitionCountdown: number | null;
-  /** Draft responses keyed by blockId — written continuously to DB */
   draftResponses: Record<string, BlockResponse>;
   selectedTemplateId: string | null;
+  lastSavedAt: string | null;
 }
 
 interface SessionActions {
-  startSession: (template: SessionTemplate) => Promise<void>;
+  startSession: (template: SessionTemplate, options?: StartSessionOptions) => Promise<void>;
   resumeSession: (run: SessionRun) => void;
   tick: () => void;
   advanceBlock: () => void;
+  jumpToBlock: (index: number) => void;
   completeBlock: () => void;
   updateResponse: (blockId: string, patch: Partial<BlockResponse>) => void;
   pauseSession: () => void;
@@ -52,17 +42,17 @@ interface SessionActions {
   completeSession: () => Promise<void>;
   persistToDb: () => Promise<void>;
   abandonSession: () => Promise<void>;
+  clearActiveRun: () => void;
   setSelectedTemplateId: (id: string | null) => void;
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const TRANSITION_SEC = 3;
 
 function emptyResponse(block: BlockConfig): BlockResponse {
   return {
     blockId: block.id,
-    questionType: block.type,
+    type: block.type,
+    questionType: block.preferredQuestionType ?? block.type,
     isComplete: false,
     timeSpentSec: 0,
   };
@@ -71,8 +61,6 @@ function emptyResponse(block: BlockConfig): BlockResponse {
 function buildResponses(blocks: BlockConfig[]): Record<string, BlockResponse> {
   return Object.fromEntries(blocks.map((b) => [b.id, emptyResponse(b)]));
 }
-
-// ─── Store ───────────────────────────────────────────────────────────────────
 
 export const useSessionStore = create<SessionState & SessionActions>()(
   (set, get) => ({
@@ -85,14 +73,34 @@ export const useSessionStore = create<SessionState & SessionActions>()(
     transitionCountdown: null,
     draftResponses: {},
     selectedTemplateId: null,
+    lastSavedAt: null,
 
     setSelectedTemplateId: (id) => set({ selectedTemplateId: id }),
 
-    // ── Start a brand-new session ─────────────────────────────────────────────
+    clearActiveRun: () =>
+      set({
+        activeRun: null,
+        currentBlockIndex: 0,
+        blockElapsedSec: 0,
+        overallElapsedSec: 0,
+        isRunning: false,
+        isPaused: false,
+        transitionCountdown: null,
+        draftResponses: {},
+      }),
 
-    startSession: async (template) => {
+    startSession: async (template, options) => {
       const now = new Date().toISOString();
-      const blockConfigs = template.blocks.map((b) => ({ ...b })); // snapshot
+      const filteredBlocks = template.blocks
+        .filter((b) =>
+          options?.selectedBlockIds ? options.selectedBlockIds.includes(b.id) : true
+        )
+        .map((b) => ({
+          ...b,
+          durationSec: options?.customDurations?.[b.id] ?? b.durationSec,
+        }));
+
+      const blockConfigs = filteredBlocks.length > 0 ? filteredBlocks : template.blocks.map((b) => ({ ...b }));
       const responses = buildResponses(blockConfigs);
 
       const run: SessionRun = {
@@ -104,12 +112,13 @@ export const useSessionStore = create<SessionState & SessionActions>()(
         currentBlockIndex: 0,
         status: 'in-progress',
         overallElapsedSec: 0,
+        instantFeedback: options?.instantFeedback ?? false,
+        preferredQuestionType: options?.preferredQuestionType ?? 'adaptive',
         startedAt: now,
         endedAt: null,
       };
 
       await db.sessionRuns.put(run);
-
       set({
         activeRun: run,
         currentBlockIndex: 0,
@@ -119,60 +128,79 @@ export const useSessionStore = create<SessionState & SessionActions>()(
         isPaused: false,
         transitionCountdown: null,
         draftResponses: responses,
+        lastSavedAt: now,
       });
     },
 
-    // ── Resume an existing in-progress run ────────────────────────────────────
-
     resumeSession: (run) => {
+      const activeBlock = run.blockConfigs[run.currentBlockIndex];
+      const savedBlockTime = activeBlock ? (run.responses[activeBlock.id]?.timeSpentSec ?? 0) : 0;
       set({
         activeRun: run,
         currentBlockIndex: run.currentBlockIndex,
-        blockElapsedSec: 0, // sub-block elapsed is not persisted; restart from 0
+        blockElapsedSec: savedBlockTime,
         overallElapsedSec: run.overallElapsedSec,
         isRunning: true,
         isPaused: false,
         transitionCountdown: null,
         draftResponses: { ...run.responses },
+        lastSavedAt: new Date().toISOString(),
       });
     },
-
-    // ── Timer tick (called every ~1s) ─────────────────────────────────────────
 
     tick: () => {
       const state = get();
       if (!state.isRunning || state.isPaused || !state.activeRun) return;
 
-      // ── Transition countdown ──
       if (state.transitionCountdown !== null) {
         if (state.transitionCountdown <= 1) {
           set({ transitionCountdown: null, blockElapsedSec: 0 });
         } else {
           set({ transitionCountdown: state.transitionCountdown - 1 });
         }
-        return; // don't advance real time during transition
+        return;
+      }
+
+      const block = state.activeRun.blockConfigs[state.currentBlockIndex];
+      if (!block) return;
+
+      // If block has already reached duration and autoAdvance is false, wait for user
+      if (state.blockElapsedSec >= block.durationSec && !block.autoAdvance) {
+        return;
       }
 
       const newBlockElapsed = state.blockElapsedSec + 1;
       const newOverall = state.overallElapsedSec + 1;
-
-      const block = state.activeRun.blockConfigs[state.currentBlockIndex];
       const isLastBlock =
         state.currentBlockIndex >= state.activeRun.blockConfigs.length - 1;
 
-      // ── Block expired ──
-      if (block && newBlockElapsed >= block.durationSec) {
-        const updatedResponses = {
-          ...state.draftResponses,
-          [block.id]: {
-            ...state.draftResponses[block.id],
-            isComplete: true,
-            timeSpentSec: block.durationSec,
-          },
+      const updatedResponses = {
+        ...state.draftResponses,
+        [block.id]: {
+          ...state.draftResponses[block.id],
+          timeSpentSec: newBlockElapsed,
+        },
+      };
+
+      if (newBlockElapsed >= block.durationSec) {
+        updatedResponses[block.id] = {
+          ...updatedResponses[block.id],
+          isComplete: true,
+          timeSpentSec: block.durationSec,
         };
 
+        // Respect autoAdvance=false: stop advancing and let user finish/inspect feedback
+        if (!block.autoAdvance) {
+          set({
+            blockElapsedSec: block.durationSec,
+            overallElapsedSec: newOverall,
+            draftResponses: updatedResponses,
+          });
+          void get().persistToDb();
+          return;
+        }
+
         if (isLastBlock) {
-          // Last block expired → auto-complete session
           set({
             blockElapsedSec: block.durationSec,
             overallElapsedSec: newOverall,
@@ -183,7 +211,6 @@ export const useSessionStore = create<SessionState & SessionActions>()(
           return;
         }
 
-        // Not last → start transition countdown
         set({
           currentBlockIndex: state.currentBlockIndex + 1,
           blockElapsedSec: 0,
@@ -195,14 +222,14 @@ export const useSessionStore = create<SessionState & SessionActions>()(
         return;
       }
 
-      // ── Normal tick ──
-      set({ blockElapsedSec: newBlockElapsed, overallElapsedSec: newOverall });
+      set({
+        blockElapsedSec: newBlockElapsed,
+        overallElapsedSec: newOverall,
+        draftResponses: updatedResponses,
+      });
 
-      // Persist every 5s to reduce IndexedDB write pressure
       if (newOverall % 5 === 0) void get().persistToDb();
     },
-
-    // ── Manual block advance (user clicks "I'm done") ─────────────────────────
 
     advanceBlock: () => {
       const state = get();
@@ -210,37 +237,53 @@ export const useSessionStore = create<SessionState & SessionActions>()(
 
       const isLast =
         state.currentBlockIndex >= state.activeRun.blockConfigs.length - 1;
+      const block = state.activeRun.blockConfigs[state.currentBlockIndex];
+
+      if (block) {
+        set({
+          draftResponses: {
+            ...state.draftResponses,
+            [block.id]: {
+              ...state.draftResponses[block.id],
+              isComplete: true,
+              timeSpentSec: state.blockElapsedSec,
+            },
+          },
+        });
+      }
 
       if (isLast) {
         void get().completeSession();
         return;
       }
 
-      const block = state.activeRun.blockConfigs[state.currentBlockIndex];
       set({
         currentBlockIndex: state.currentBlockIndex + 1,
         blockElapsedSec: 0,
         transitionCountdown: TRANSITION_SEC,
-        draftResponses: {
-          ...state.draftResponses,
-          [block.id]: {
-            ...state.draftResponses[block.id],
-            isComplete: true,
-            timeSpentSec: state.blockElapsedSec,
-          },
-        },
       });
       void get().persistToDb();
     },
 
-    // ── Explicitly mark current block complete (without advancing) ────────────
+    jumpToBlock: (index) => {
+      const state = get();
+      if (!state.activeRun) return;
+      if (index < 0 || index >= state.activeRun.blockConfigs.length) return;
+      const targetBlock = state.activeRun.blockConfigs[index];
+      const priorSpent = state.draftResponses[targetBlock.id]?.timeSpentSec ?? 0;
+      set({
+        currentBlockIndex: index,
+        blockElapsedSec: Math.min(priorSpent, targetBlock.durationSec - 1),
+        transitionCountdown: null,
+      });
+      void get().persistToDb();
+    },
 
     completeBlock: () => {
       const state = get();
       if (!state.activeRun) return;
       const block = state.activeRun.blockConfigs[state.currentBlockIndex];
       if (!block) return;
-
       set({
         draftResponses: {
           ...state.draftResponses,
@@ -254,11 +297,12 @@ export const useSessionStore = create<SessionState & SessionActions>()(
       void get().persistToDb();
     },
 
-    // ── Update a draft response (text typed, audio recorded, etc.) ────────────
-
     updateResponse: (blockId, patch) => {
-      const existing = get().draftResponses[blockId];
-      if (!existing) return;
+      const existing = get().draftResponses[blockId] ?? {
+        blockId,
+        isComplete: false,
+        timeSpentSec: get().blockElapsedSec,
+      };
       set({
         draftResponses: {
           ...get().draftResponses,
@@ -271,8 +315,6 @@ export const useSessionStore = create<SessionState & SessionActions>()(
     pauseSession: () => set({ isPaused: true }),
     resumeRunning: () => set({ isPaused: false }),
 
-    // ── Complete the session ──────────────────────────────────────────────────
-
     completeSession: async () => {
       const state = get();
       if (!state.activeRun) return;
@@ -284,40 +326,38 @@ export const useSessionStore = create<SessionState & SessionActions>()(
         overallElapsedSec: state.overallElapsedSec,
         status: 'completed',
         endedAt: new Date().toISOString(),
+        summary: {
+          durationSec: state.overallElapsedSec,
+        },
       };
 
       await db.sessionRuns.put(completed);
-
       set({
-        activeRun: completed,  // keep for PostSession to read
+        activeRun: completed,
         isRunning: false,
         isPaused: false,
         transitionCountdown: null,
+        lastSavedAt: new Date().toISOString(),
       });
     },
-
-    // ── Persist current state to IndexedDB ────────────────────────────────────
 
     persistToDb: async () => {
       const state = get();
       if (!state.activeRun) return;
-
+      const now = new Date().toISOString();
       const snapshot: SessionRun = {
         ...state.activeRun,
         responses: state.draftResponses,
         currentBlockIndex: state.currentBlockIndex,
         overallElapsedSec: state.overallElapsedSec,
       };
-
       await db.sessionRuns.put(snapshot);
+      set({ lastSavedAt: now });
     },
-
-    // ── Abandon (save state but mark as abandoned) ────────────────────────────
 
     abandonSession: async () => {
       const state = get();
       if (!state.activeRun) return;
-
       const abandoned: SessionRun = {
         ...state.activeRun,
         responses: { ...state.draftResponses },
@@ -326,9 +366,7 @@ export const useSessionStore = create<SessionState & SessionActions>()(
         status: 'abandoned',
         endedAt: new Date().toISOString(),
       };
-
       await db.sessionRuns.put(abandoned);
-
       set({
         activeRun: null,
         currentBlockIndex: 0,
@@ -342,10 +380,6 @@ export const useSessionStore = create<SessionState & SessionActions>()(
     },
   })
 );
-
-// ─── Selector Functions ───────────────────────────────────────────────────────
-// Use with: useSessionStore(selector) — selector-based subscriptions avoid
-// re-rendering the full tree on every 1s tick.
 
 type S = SessionState;
 

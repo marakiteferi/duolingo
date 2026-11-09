@@ -11,7 +11,6 @@ export function TemplateEditor() {
   const templates = useConfigStore((s) => s.templates)
   const saveTemplate = useConfigStore((s) => s.saveTemplate)
   const deleteTemplate = useConfigStore((s) => s.deleteTemplate)
-  const [editingId, setEditingId] = useState<string | null>(null)
   const [editingTemplate, setEditingTemplate] = useState<SessionTemplate | null>(null)
 
   const blockTypes: { value: BlockType; label: string }[] = [
@@ -31,12 +30,10 @@ export function TemplateEditor() {
       updatedAt: new Date().toISOString(),
     }
     setEditingTemplate(newTemplate)
-    setEditingId(newTemplate.id)
   }
 
   const handleEdit = (template: SessionTemplate) => {
     setEditingTemplate({ ...template, blocks: [...template.blocks] })
-    setEditingId(template.id)
   }
 
   const handleSave = async () => {
@@ -46,12 +43,10 @@ export function TemplateEditor() {
       updatedAt: new Date().toISOString(),
     })
     setEditingTemplate(null)
-    setEditingId(null)
   }
 
   const handleCancel = () => {
     setEditingTemplate(null)
-    setEditingId(null)
   }
 
   const addBlock = () => {
@@ -63,6 +58,7 @@ export function TemplateEditor() {
       durationSec: 300,
       instructions: '',
       autoAdvance: true,
+      evalPromptId: '',
     }
     setEditingTemplate({
       ...editingTemplate,

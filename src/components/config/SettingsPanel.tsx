@@ -149,10 +149,54 @@ export function SettingsPanel() {
                 }
                 className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
               >
-                <option value="whisper">OpenAI Whisper API (recommended)</option>
-                <option value="web-speech-api">Web Speech API (free fallback)</option>
+                <option value="local-whisper">⚡ Local Faster-Whisper GPU Server (Recommended, Verbatim)</option>
+                <option value="whisper">OpenAI Whisper API (Cloud, Requires API Key)</option>
+                <option value="web-speech-api">Web Speech API (Browser built-in fallback)</option>
               </select>
             </div>
+
+            {settings.sttProvider === 'local-whisper' && (
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-2">
+                <label className="block text-xs font-semibold text-slate-700">
+                  Local Whisper API Endpoint
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={settings.localSttEndpoint ?? 'http://127.0.0.1:8000/transcribe'}
+                    onChange={(e) =>
+                      setSettings({ ...settings, localSttEndpoint: e.target.value })
+                    }
+                    className="flex-1 px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono focus:outline-none focus:ring-2 focus:ring-primary-500"
+                    placeholder="http://127.0.0.1:8000/transcribe"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const endpoint = settings.localSttEndpoint || 'http://127.0.0.1:8000/transcribe';
+                      const healthUrl = endpoint.replace(/\/transcribe\/?$/, '/health');
+                      try {
+                        const res = await fetch(healthUrl);
+                        if (res.ok) {
+                          const data = await res.json();
+                          alert(`✅ Connected to Local Whisper GPU Server!\nModel: ${data.model || 'turbo'}\nDevice: ${data.device || 'cuda'}`);
+                        } else {
+                          alert(`⚠️ Server responded with status ${res.status}`);
+                        }
+                      } catch (err) {
+                        alert(`❌ Cannot connect to local Whisper at ${healthUrl}.\nMake sure you ran the backend with:\ncd stt-backend && uvicorn app:app --port 8000`);
+                      }
+                    }}
+                    className="px-3 py-1.5 text-xs font-semibold text-primary-700 bg-primary-100 hover:bg-primary-200 rounded-lg transition-colors"
+                  >
+                    Test Connection
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  Run <code>python app.py</code> in <code>stt-backend/</code> to enable real-time local GPU transcription.
+                </p>
+              </div>
+            )}
 
             {settings.sttProvider === 'whisper' && (
               <div>

@@ -1,49 +1,121 @@
-/**
- * Speech-to-Text service interface and implementations.
- *
- * Provides two STT backends:
- *   1. WhisperSTTProvider  — OpenAI Whisper API (high accuracy, requires API key)
- *   2. WebSpeechSTTProvider — Browser SpeechRecognition API (free fallback, less accurate)
- *
- * Use the `createSTTProvider` factory to instantiate the desired provider.
- */
+import type { STTProvider as STTProviderType } from '../types';
 
-// ─── STT Provider Interface ──────────────────────────────────────────────────
-
-/** Abstracted interface every STT backend must satisfy */
 export interface STTProvider {
-  /** Transcribe an audio blob to text */
   transcribe(audioBlob: Blob, language?: string): Promise<string>;
-  /** Returns true if this provider can be used in the current environment */
   isAvailable(): boolean;
 }
 
-// ─── Constants ───────────────────────────────────────────────────────────────
-
-/** OpenAI Whisper endpoint */
-const WHISPER_API_URL = 'https://api.openai.com/v1/audio/transcriptions';
-
-/** Whisper API file-size hard limit is 25 MB; we guard at 24 MB for safety */
+const LOCAL_WHISPER_DEFAULT_URL = 'http://127.0.0.1:8000/transcribe';
+const LOCAL_WHISPER_HEALTH_URL = 'http://127.0.0.1:8000/health';
+const OPENAI_WHISPER_API_URL = 'https://api.openai.com/v1/audio/transcriptions';
 const MAX_BLOB_SIZE_BYTES = 24 * 1024 * 1024;
 
-/** Map MIME types to file extensions Whisper expects */
-const MIME_TO_EXT: Record<string, string> = {
-  'audio/webm': 'webm',
-  'audio/webm;codecs=opus': 'webm',
-  'audio/mp4': 'mp4',
-  'audio/mpeg': 'mp3',
-  'audio/wav': 'wav',
-  'audio/ogg': 'ogg',
-  'audio/flac': 'flac',
-};
-
-// ─── Whisper STT Provider ────────────────────────────────────────────────────
+/**
+ * Checks whether the local Python FastAPI faster-whisper server is online.
+ */
+export async function checkLocalWhisperHealth(
+  transcribeUrl: string = LOCAL_WHISPER_DEFAULT_URL
+): Promise<boolean> {
+  try {
+    const baseUrl = transcribeUrl.replace(/\/transcribe\/?$/, '');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    const res = await fetch(`${baseUrl}/health`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (res.ok) return true;
+    // Even if /health isn't added yet, a 404 from uvicorn means the server is up!
+    return res.status === 404;
+  } catch {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2000);
+      const res = await fetch(LOCAL_WHISPER_HEALTH_URL, { signal: controller.signal });
+      clearTimeout(timer);
+      return res.ok || res.status === 404;
+    } catch {
+      return false;
+    }
+  }
+}
 
 /**
- * Transcription via OpenAI's Whisper API.
- *
- * Sends the audio blob as multipart/form-data and returns the transcript text.
- * Requires a valid OpenAI API key.
+ * Analyzes a verbatim transcript for filler words, hesitations, and WPM.
+ */
+export function analyzeSpeechTranscript(text: string, durationSec: number): {
+  wordCount: number;
+  fillerCount: number;
+  fillersFound: string[];
+  wpm: number;
+} {
+  const clean = text.trim();
+  if (!clean) {
+    return { wordCount: 0, fillerCount: 0, fillersFound: [], wpm: 0 };
+  }
+  const words = clean.split(/\s+/);
+  const wordCount = words.length;
+  const fillerRegex = /\b(uh+|um+|er+|ah+|hmm+|like|you know|basically|literally)\b|\[(silent|cough|pause)\]/gi;
+  const matches = clean.match(fillerRegex) ?? [];
+  const minutes = Math.max(0.1, durationSec / 60);
+  const wpm = Math.round(wordCount / minutes);
+
+  return {
+    wordCount,
+    fillerCount: matches.length,
+    fillersFound: matches.map((m) => m.toLowerCase()),
+    wpm,
+  };
+}
+
+/**
+ * Primary Provider: Local Faster-Whisper running on RTX 3050 (http://127.0.0.1:8000/transcribe)
+ */
+export class LocalWhisperSTTProvider implements STTProvider {
+  private readonly endpointUrl: string;
+
+  constructor(endpointUrl: string = LOCAL_WHISPER_DEFAULT_URL) {
+    this.endpointUrl = endpointUrl || LOCAL_WHISPER_DEFAULT_URL;
+  }
+
+  isAvailable(): boolean {
+    return true;
+  }
+
+  async transcribe(audioBlob: Blob): Promise<string> {
+    const audioFile = new File([audioBlob], 'recording.webm', {
+      type: audioBlob.type || 'audio/webm',
+    });
+    const formData = new FormData();
+    formData.append('file', audioFile);
+
+    let response: Response;
+    try {
+      response = await fetch(this.endpointUrl, {
+        method: 'POST',
+        body: formData,
+      });
+    } catch {
+      throw new Error(
+        'Could not connect to local Whisper server at ' +
+          this.endpointUrl +
+          '. Make sure your Python terminal (python app.py) is running on port 8000.'
+      );
+    }
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => 'Unknown server error');
+      throw new Error(`Local Whisper error (${response.status}): ${errText}`);
+    }
+
+    const data = (await response.json()) as { text?: string };
+    if (typeof data.text !== 'string') {
+      throw new Error('Local Whisper returned an unexpected JSON payload.');
+    }
+    return data.text;
+  }
+}
+
+/**
+ * Optional Cloud OpenAI Whisper Provider
  */
 export class WhisperSTTProvider implements STTProvider {
   private readonly apiKey: string;
@@ -52,183 +124,69 @@ export class WhisperSTTProvider implements STTProvider {
     this.apiKey = apiKey;
   }
 
-  /** Whisper is available as long as we have a non-empty API key */
   isAvailable(): boolean {
     return this.apiKey.length > 0;
   }
 
   async transcribe(audioBlob: Blob, language: string = 'en'): Promise<string> {
-    // ── Guard: blob size ──
     if (audioBlob.size > MAX_BLOB_SIZE_BYTES) {
-      throw new Error(
-        `Audio blob is ${(audioBlob.size / 1024 / 1024).toFixed(1)} MB — ` +
-        `exceeds the 24 MB limit for Whisper API.`
-      );
+      throw new Error('Audio exceeds 24 MB limit.');
     }
-
-    // ── Determine file extension from MIME type ──
-    const ext = MIME_TO_EXT[audioBlob.type] ?? 'webm'; // default to webm
-    const filename = `recording.${ext}`;
-
-    // ── Build multipart form data ──
+    const audioFile = new File([audioBlob], 'recording.webm', { type: 'audio/webm' });
     const formData = new FormData();
-    formData.append('file', audioBlob, filename);
+    formData.append('file', audioFile);
     formData.append('model', 'whisper-1');
     formData.append('language', language);
+    formData.append('prompt', 'Uh, um, like, so yeah, well, [cough], [silent]...');
 
-    try {
-      const response = await fetch(WHISPER_API_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          // Note: do NOT set Content-Type — the browser sets it with the boundary
-        },
-        body: formData,
-      });
+    const response = await fetch(OPENAI_WHISPER_API_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+      body: formData,
+    });
 
-      // ── Handle HTTP errors ──
-      if (!response.ok) {
-        const errorBody = await response.text().catch(() => 'Unknown error');
-
-        if (response.status === 401) {
-          throw new Error('Invalid OpenAI API key. Please check your settings.');
-        }
-        if (response.status === 429) {
-          throw new Error('OpenAI rate limit exceeded. Please wait a moment and try again.');
-        }
-        if (response.status === 413) {
-          throw new Error('Audio file too large for the Whisper API.');
-        }
-
-        throw new Error(
-          `Whisper API error (${response.status}): ${errorBody}`
-        );
-      }
-
-      const data = (await response.json()) as { text?: string };
-
-      if (typeof data.text !== 'string') {
-        throw new Error('Unexpected response format from Whisper API.');
-      }
-
-      return data.text;
-    } catch (error) {
-      // Re-throw our own errors, wrap unknown ones
-      if (error instanceof Error) {
-        // Network errors or our custom errors
-        throw error;
-      }
-      throw new Error(`Whisper transcription failed: ${String(error)}`);
+    if (!response.ok) {
+      throw new Error(`OpenAI Whisper error (${response.status})`);
     }
+    const data = (await response.json()) as { text?: string };
+    return data.text ?? '';
   }
 }
 
-// ─── Web Speech API Provider ─────────────────────────────────────────────────
-
 /**
- * Fallback STT using the browser's built-in SpeechRecognition API.
- *
- * Note: This performs *real-time* recognition from the microphone, NOT
- * transcription of a pre-recorded blob. The `audioBlob` parameter is ignored —
- * the browser listens directly.  This is a convenience fallback; Whisper
- * should be preferred for accuracy.
+ * Browser Web Speech API Fallback
  */
 export class WebSpeechSTTProvider implements STTProvider {
-  /** Check if the browser supports the SpeechRecognition API */
   isAvailable(): boolean {
-    return typeof window !== 'undefined' &&
-      !!(
-        (window as any).SpeechRecognition ||
-        (window as any).webkitSpeechRecognition
-      );
+    return (
+      typeof window !== 'undefined' &&
+      Boolean((window as unknown as Record<string, unknown>).SpeechRecognition ||
+              (window as unknown as Record<string, unknown>).webkitSpeechRecognition)
+    );
   }
 
-  /**
-   * Start real-time speech recognition and resolve with the final transcript.
-   *
-   * @param _audioBlob — Ignored; included for interface compatibility.
-   * @param language   — BCP-47 language code (default: 'en-US').
-   */
-  async transcribe(_audioBlob: Blob, language: string = 'en-US'): Promise<string> {
-    if (!this.isAvailable()) {
-      throw new Error(
-        'SpeechRecognition API is not supported in this browser.'
-      );
-    }
-
-    const SpeechRecognitionCtor: typeof SpeechRecognition =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
-
-    return new Promise<string>((resolve, reject) => {
-      const recognition = new SpeechRecognitionCtor();
-
-      // ── Configuration ──
-      recognition.continuous = true;
-      recognition.interimResults = false;
-      recognition.lang = language;
-
-      let transcript = '';
-
-      recognition.onresult = (event: SpeechRecognitionEvent) => {
-        // Accumulate all final results
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          if (event.results[i].isFinal) {
-            transcript += event.results[i][0].transcript;
-          }
-        }
-      };
-
-      recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-        // 'no-speech' is non-fatal — just means silence was detected
-        if (event.error === 'no-speech') {
-          return;
-        }
-        reject(new Error(`Speech recognition error: ${event.error}`));
-      };
-
-      recognition.onend = () => {
-        // Resolve with whatever transcript was collected
-        resolve(transcript.trim());
-      };
-
-      recognition.start();
-
-      // Safety timeout: stop after 60 seconds to prevent hanging
-      setTimeout(() => {
-        try {
-          recognition.stop();
-        } catch {
-          // Already stopped — ignore
-        }
-      }, 60_000);
-    });
+  async transcribe(_audioBlob: Blob): Promise<string> {
+    throw new Error(
+      'Web Speech API only works in live-streaming mode. Use Local Whisper (port 8000) to transcribe recorded audio blobs.'
+    );
   }
 }
 
-// ─── Factory ─────────────────────────────────────────────────────────────────
-
-/**
- * Create an STT provider instance.
- *
- * @param provider — Which backend to use.
- * @param apiKey   — Required for 'whisper'; ignored for 'web-speech-api'.
- */
 export function createSTTProvider(
-  provider: 'whisper' | 'web-speech-api',
-  apiKey?: string,
+  provider: STTProviderType,
+  options?: { apiKey?: string; localWhisperUrl?: string }
 ): STTProvider {
   switch (provider) {
-    case 'whisper': {
-      if (!apiKey) {
-        throw new Error('An OpenAI API key is required for Whisper STT.');
+    case 'local-whisper':
+      return new LocalWhisperSTTProvider(options?.localWhisperUrl);
+    case 'whisper':
+      if (!options?.apiKey) {
+        return new LocalWhisperSTTProvider(options?.localWhisperUrl);
       }
-      return new WhisperSTTProvider(apiKey);
-    }
-    case 'web-speech-api': {
+      return new WhisperSTTProvider(options.apiKey);
+    case 'web-speech-api':
       return new WebSpeechSTTProvider();
-    }
     default:
-      throw new Error(`Unknown STT provider: ${provider}`);
+      return new LocalWhisperSTTProvider(options?.localWhisperUrl);
   }
 }

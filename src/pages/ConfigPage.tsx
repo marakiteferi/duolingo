@@ -4,6 +4,7 @@ import { useConfigStore } from '../stores/configStore'
 import { TemplateEditor } from '../components/config/TemplateEditor'
 import { QuestionBankEditor } from '../components/config/QuestionBankEditor'
 import { EvalPromptEditor } from '../components/config/EvalPromptEditor'
+import { HistoryPanel } from '../components/config/HistoryPanel'
 import { SettingsPanel } from '../components/config/SettingsPanel'
 
 /**
@@ -31,6 +32,7 @@ export function ConfigPage() {
     { key: 'templates' as const, label: 'Session Templates', icon: '📋' },
     { key: 'questions' as const, label: 'Question Bank', icon: '❓' },
     { key: 'eval-prompts' as const, label: 'Eval Prompts', icon: '🤖' },
+    { key: 'history' as const, label: 'Score History', icon: '📊' },
     { key: 'settings' as const, label: 'Settings', icon: '⚙️' },
   ]
 
@@ -80,6 +82,7 @@ export function ConfigPage() {
           {configSection === 'templates' && <TemplateEditor />}
           {configSection === 'questions' && <QuestionBankEditor />}
           {configSection === 'eval-prompts' && <EvalPromptEditor />}
+          {configSection === 'history' && <HistoryPanel />}
           {configSection === 'settings' && <SettingsPanel />}
         </div>
       </main>
