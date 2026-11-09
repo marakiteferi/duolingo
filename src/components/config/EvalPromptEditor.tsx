@@ -1,26 +1,23 @@
-import { useState } from 'react'
-import { useConfigStore } from '../../stores/configStore'
-import type { EvalPrompt, BlockType, ScoreScale } from '../../types'
-import { generateId } from '../../utils/helpers'
+import { useState } from 'react';
+import { useConfigStore } from '../../stores/configStore';
+import type { EvalPrompt, BlockType, ScoreScale } from '../../types';
+import { generateId } from '../../utils/helpers';
 
-/**
- * EvalPromptEditor — Editor for AI evaluation prompt templates.
- * Each eval prompt is a system prompt sent to Gemini, with template
- * variables like {{prompt}}, {{response}}, {{transcript}}, {{durationSec}}.
- */
 export function EvalPromptEditor() {
-  const evalPrompts = useConfigStore((s) => s.evalPrompts)
-  const saveEvalPrompt = useConfigStore((s) => s.saveEvalPrompt)
-  const deleteEvalPrompt = useConfigStore((s) => s.deleteEvalPrompt)
-  const [editing, setEditing] = useState<EvalPrompt | null>(null)
+  const evalPrompts = useConfigStore((s) => s.evalPrompts);
+  const saveEvalPrompt = useConfigStore((s) => s.saveEvalPrompt);
+  const deleteEvalPrompt = useConfigStore((s) => s.deleteEvalPrompt);
+  const [editing, setEditing] = useState<EvalPrompt | null>(null);
 
   const blockTypes: { value: BlockType; label: string }[] = [
     { value: 'brain-dump', label: 'Brain Dump' },
-    { value: 'vocab-writing', label: 'Vocab & Writing' },
-    { value: 'speaking', label: 'Speaking' },
+    { value: 'vocab-writing', label: 'Collocation Chunk Writing' },
+    { value: 'speaking', label: 'Timestamped Speaking' },
+    { value: 'shadowing', label: 'Arguelles Shadowing' },
+    { value: 'dictogloss', label: 'Dictogloss Reconstruction' },
     { value: 'mock-test', label: 'Mock Test' },
     { value: 'custom', label: 'Custom' },
-  ]
+  ];
 
   const handleNew = () => {
     setEditing({
@@ -29,14 +26,14 @@ export function EvalPromptEditor() {
       appliesToType: 'vocab-writing',
       promptText: '',
       scoreScale: 'det-0-160',
-    })
-  }
+    });
+  };
 
   const handleSave = async () => {
-    if (!editing) return
-    await saveEvalPrompt(editing)
-    setEditing(null)
-  }
+    if (!editing) return;
+    await saveEvalPrompt(editing);
+    setEditing(null);
+  };
 
   const templateVars = [
     '{{prompt}}',
@@ -45,7 +42,7 @@ export function EvalPromptEditor() {
     '{{durationSec}}',
     '{{fillerCount}}',
     '{{wpm}}',
-  ]
+  ];
 
   return (
     <div>
@@ -53,42 +50,28 @@ export function EvalPromptEditor() {
         <div>
           <h2 className="text-xl font-bold text-slate-900">Evaluation Prompts</h2>
           <p className="text-sm text-slate-500 mt-1">
-            Customize the AI prompts used to score your responses
+            Customize the AI rubrics used to score your responses
           </p>
         </div>
         <button
           onClick={handleNew}
-          className="px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 transition-colors"
+          className="px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700"
         >
           + New Prompt
         </button>
       </div>
 
-      {/* Prompt list */}
       {!editing && (
         <div className="space-y-3">
-          {evalPrompts.length === 0 && (
-            <div className="text-center py-8 text-slate-400">
-              <p>No evaluation prompts configured</p>
-            </div>
-          )}
           {evalPrompts.map((ep) => (
-            <div
-              key={ep.id}
-              className="bg-white rounded-lg border border-slate-200 p-4 hover:border-primary-300 transition-colors"
-            >
+            <div key={ep.id} className="bg-white rounded-lg border border-slate-200 p-4">
               <div className="flex items-start justify-between">
                 <div>
                   <h3 className="font-semibold text-slate-900">{ep.name}</h3>
-                  <div className="flex items-center gap-2 mt-1">
-                    <span className="text-xs bg-accent-100 text-accent-700 px-2 py-0.5 rounded">
-                      {ep.appliesToType}
-                    </span>
-                    <span className="text-xs text-slate-400">
-                      Scale: {ep.scoreScale}
-                    </span>
-                  </div>
-                  <p className="text-sm text-slate-500 mt-2 line-clamp-2 font-mono">
+                  <span className="text-xs bg-accent-100 text-accent-700 px-2 py-0.5 rounded">
+                    {ep.appliesToType}
+                  </span>
+                  <p className="text-xs text-slate-500 mt-2 line-clamp-2 font-mono">
                     {ep.promptText.slice(0, 150)}...
                   </p>
                 </div>
@@ -112,20 +95,8 @@ export function EvalPromptEditor() {
         </div>
       )}
 
-      {/* Prompt editor */}
       {editing && (
         <div className="bg-white rounded-lg border border-slate-200 p-6">
-          <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-100">
-            <button
-              type="button"
-              onClick={() => setEditing(null)}
-              className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
-            >
-              ← Back to Prompts List
-            </button>
-            <span className="text-xs text-slate-400">Gemini Rubric Editor</span>
-          </div>
-
           <div className="grid grid-cols-3 gap-4 mb-4">
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Name</label>
@@ -133,7 +104,7 @@ export function EvalPromptEditor() {
                 type="text"
                 value={editing.name}
                 onChange={(e) => setEditing({ ...editing, name: e.target.value })}
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
               />
             </div>
             <div>
@@ -143,7 +114,7 @@ export function EvalPromptEditor() {
                 onChange={(e) =>
                   setEditing({ ...editing, appliesToType: e.target.value as BlockType })
                 }
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
               >
                 {blockTypes.map((bt) => (
                   <option key={bt.value} value={bt.value}>
@@ -159,7 +130,7 @@ export function EvalPromptEditor() {
                 onChange={(e) =>
                   setEditing({ ...editing, scoreScale: e.target.value as ScoreScale })
                 }
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
               >
                 <option value="det-0-160">DET (0–160)</option>
                 <option value="custom">Custom</option>
@@ -167,8 +138,7 @@ export function EvalPromptEditor() {
             </div>
           </div>
 
-          {/* Template variables hint */}
-          <div className="mb-2 flex items-center gap-2">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
             <span className="text-xs text-slate-500">Available variables:</span>
             {templateVars.map((v) => (
               <code key={v} className="text-xs bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">
@@ -177,27 +147,20 @@ export function EvalPromptEditor() {
             ))}
           </div>
 
-          <div className="mb-6">
-            <label className="block text-sm font-medium text-slate-700 mb-1">Prompt Template</label>
-            <textarea
-              value={editing.promptText}
-              onChange={(e) => setEditing({ ...editing, promptText: e.target.value })}
-              rows={16}
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500 resize-y"
-              placeholder="You are scoring a Duolingo English Test response..."
-            />
-          </div>
+          <textarea
+            value={editing.promptText}
+            onChange={(e) => setEditing({ ...editing, promptText: e.target.value })}
+            rows={14}
+            className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono mb-4"
+          />
 
           <div className="flex justify-end gap-3">
-            <button
-              onClick={() => setEditing(null)}
-              className="px-4 py-2 text-sm text-slate-600 hover:text-slate-900"
-            >
+            <button onClick={() => setEditing(null)} className="px-4 py-2 text-sm text-slate-600">
               Cancel
             </button>
             <button
               onClick={handleSave}
-              className="px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 transition-colors"
+              className="px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg"
             >
               Save Prompt
             </button>
@@ -205,6 +168,5 @@ export function EvalPromptEditor() {
         </div>
       )}
     </div>
-  )
+  );
 }
-

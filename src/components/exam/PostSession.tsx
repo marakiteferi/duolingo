@@ -22,22 +22,19 @@ export function PostSession() {
   const handleUpdateText = (blockId: string, text: string) => {
     setLocalResponses((prev) => ({
       ...prev,
-      [blockId]: { ...prev[blockId], textOrTranscript: text },
+      [blockId]: { ...prev[blockId], textOrTranscript: text, timestampedTranscript: text },
     }));
   };
 
   const handleEvaluate = useCallback(async () => {
     if (!activeRun) return;
-
     if (!navigator.onLine) {
       setQueuedOffline(true);
       setEvalError('You are currently offline. Responses are saved and will auto-evaluate when back online.');
       return;
     }
-
     setEvaluating(true);
     setEvalError(null);
-
     try {
       const settings = await db.settings.get('app-settings');
       if (!settings?.geminiApiKey) {
@@ -45,7 +42,6 @@ export function PostSession() {
         setEvaluating(false);
         return;
       }
-
       const evalPrompts = await db.evalPrompts.toArray();
       const updatedResponses = { ...localResponses };
       const blockScores: number[] = [];
@@ -55,13 +51,15 @@ export function PostSession() {
         const response = updatedResponses[block.id];
         const text = response?.textOrTranscript?.trim() ?? '';
         if (!text) continue;
-
         const evalPrompt =
           evalPrompts.find((ep) => ep.id === block.evalPromptId) ??
           evalPrompts.find((ep) => ep.appliesToType === block.type) ??
           evalPrompts[0];
-
         if (!evalPrompt) continue;
+
+        const verifiedDuration =
+          response?.audioDurationSec ??
+          (response?.timeSpentSec && response.timeSpentSec > 0 ? response.timeSpentSec : block.durationSec);
 
         const feedback = await evaluateResponse({
           apiKey: settings.geminiApiKey,
@@ -70,7 +68,9 @@ export function PostSession() {
             prompt: response?.promptSnapshot || block.instructions,
             response: text,
             transcript: response?.timestampedTranscript || text,
-            durationSec: String(response?.audioDurationSec ?? response?.timeSpentSec ?? block.durationSec),
+            durationSec: String(verifiedDuration),
+            wpm: String(response?.wpm ?? 130),
+            fillerCount: String(response?.fillerCount ?? 0),
           },
         });
 
@@ -80,12 +80,13 @@ export function PostSession() {
           (subVals.length > 0
             ? Math.round(subVals.reduce((a, b) => a + b, 0) / subVals.length)
             : 125);
-
         blockScores.push(computedScore);
 
         const targetSkill: DETSkill =
-          block.type === 'speaking'
+          block.type === 'speaking' || block.type === 'shadowing'
             ? 'speaking'
+            : block.type === 'dictogloss'
+            ? 'listening'
             : block.type === 'mock-test'
             ? 'reading'
             : 'writing';
@@ -104,7 +105,6 @@ export function PostSession() {
         blockScores.length > 0
           ? Math.round(blockScores.reduce((a, b) => a + b, 0) / blockScores.length)
           : undefined;
-
       const perSkillScores: Partial<Record<DETSkill, number>> = {};
       for (const [sk, arr] of Object.entries(skillScores) as [DETSkill, number[]][]) {
         if (arr && arr.length > 0) {
@@ -123,20 +123,15 @@ export function PostSession() {
       });
       setQueuedOffline(false);
     } catch (err) {
-      setEvalError(
-        err instanceof Error ? err.message : 'Evaluation failed. Check your Gemini API key.'
-      );
+      setEvalError(err instanceof Error ? err.message : 'Evaluation failed.');
     } finally {
       setEvaluating(false);
     }
   }, [activeRun, localResponses]);
 
-  // Auto-evaluate when connection is restored if queued offline
   useEffect(() => {
     if (!queuedOffline) return;
-    const onOnline = () => {
-      void handleEvaluate();
-    };
+    const onOnline = () => void handleEvaluate();
     window.addEventListener('online', onOnline);
     return () => window.removeEventListener('online', onOnline);
   }, [queuedOffline, handleEvaluate]);
@@ -153,35 +148,7 @@ export function PostSession() {
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-8">
-      {/* Top Navigation Bar */}
-      <div className="flex items-center justify-between mb-6 pb-3 border-b border-slate-200">
-        <button
-          type="button"
-          onClick={() => {
-            clearActiveRun();
-            setView('config');
-          }}
-          className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-100 px-3 py-1.5 rounded-lg transition-colors cursor-pointer shadow-2xs"
-        >
-          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-          </svg>
-          ← Back to Dashboard
-        </button>
-
-        <button
-          type="button"
-          onClick={() => {
-            clearActiveRun();
-          }}
-          className="flex items-center gap-1 text-xs font-semibold text-primary-700 bg-primary-50 border border-primary-200 hover:bg-primary-100 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
-        >
-          + Choose New Practice Exam
-        </button>
-      </div>
-
-      {/* Header Banner */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-6 mb-8 flex flex-wrap items-center justify-between gap-4 shadow-xs">
+      <div className="bg-white border border-slate-200 rounded-2xl p-6 mb-8 flex flex-wrap items-center justify-between gap-4">
         <div>
           <span className="text-xs font-bold uppercase tracking-wider text-primary-600">
             Session Complete
@@ -191,20 +158,19 @@ export function PostSession() {
             Total Time: {formatTime(activeRun.overallElapsedSec)} • {activeRun.blockConfigs.length} Blocks
           </p>
         </div>
-
         {sessionAverage !== null ? (
           <div className="text-right bg-primary-50 border border-primary-200 px-5 py-3 rounded-xl">
             <span className="text-xs font-semibold text-primary-700 block">Estimated DET Band</span>
             <span className="text-4xl font-black text-primary-600">{sessionAverage}</span>
-            <span className="text-xs text-primary-600"> / 160 (Target: 140–150)</span>
+            <span className="text-xs text-primary-600"> / 160</span>
           </div>
         ) : (
           <button
             onClick={handleEvaluate}
             disabled={evaluating}
-            className="px-6 py-3 bg-primary-600 text-white text-sm font-bold rounded-xl hover:bg-primary-700 disabled:opacity-50 cursor-pointer shadow-sm"
+            className="px-6 py-3 bg-primary-600 text-white text-sm font-bold rounded-xl hover:bg-primary-700 disabled:opacity-50 cursor-pointer"
           >
-            {evaluating ? '⏳ Grading with Gemini...' : '✨ Grade All Blocks with Gemini AI'}
+            {evaluating ? 'Grading with Gemini...' : 'Grade All Blocks with Gemini AI'}
           </button>
         )}
       </div>
@@ -215,28 +181,25 @@ export function PostSession() {
         </div>
       )}
 
-      {/* Per-block review cards */}
       <div className="space-y-6">
         {activeRun.blockConfigs.map((block, idx) => {
           const response = localResponses[block.id];
           const feedback = response?.aiFeedback;
           const score = response?.aiOverallScore;
-
+          const verifiedSec = response?.audioDurationSec ?? response?.timeSpentSec ?? 0;
           return (
             <div key={block.id} className="bg-white rounded-xl border border-slate-200 overflow-hidden">
               <div className="flex items-center justify-between p-4 bg-slate-50 border-b border-slate-100">
-                <div className="flex items-center gap-3">
-                  <span className="w-7 h-7 rounded-full bg-slate-200 text-slate-700 text-xs flex items-center justify-center font-bold">
-                    {idx + 1}
-                  </span>
-                  <div>
-                    <h3 className="font-semibold text-slate-900">{block.name}</h3>
-                    <p className="text-xs text-slate-500">
-                      {block.type} • {formatTime(response?.timeSpentSec ?? 0)} spent
-                      {response?.wpm ? ` • ${response.wpm} WPM` : ''}
-                      {response?.fillerCount !== undefined ? ` • ${response.fillerCount} fillers` : ''}
-                    </p>
-                  </div>
+                <div>
+                  <h3 className="font-semibold text-slate-900">
+                    {idx + 1}. {block.name}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    {block.type} • Verified Duration: {verifiedSec}s
+                    {response?.wpm ? ` • ${response.wpm} WPM` : ''}
+                    {response?.fillerCount !== undefined ? ` • ${response.fillerCount} fillers` : ''}
+                    {response?.attemptCount && response.attemptCount > 1 ? ` • ${response.attemptCount} attempts` : ''}
+                  </p>
                 </div>
                 {score !== undefined && (
                   <div className="text-right">
@@ -245,85 +208,25 @@ export function PostSession() {
                   </div>
                 )}
               </div>
-
               <div className="p-5 space-y-4">
                 {response?.audioBlobRef && (
-                  <div>
-                    <label className="block text-xs font-medium text-slate-500 mb-1">
-                      Recorded Audio
-                    </label>
-                    <audio controls src={response.audioBlobRef} className="w-full h-10" />
-                  </div>
+                  <audio controls src={response.audioBlobRef} className="w-full h-10" />
                 )}
-
                 <div>
                   <label className="block text-xs font-medium text-slate-500 mb-1">
-                    Your Response / Verbatim Transcript (Editable before re-evaluating):
+                    Response / Timestamped Verbatim Transcript:
                   </label>
                   <textarea
-                    value={response?.textOrTranscript ?? ''}
+                    value={response?.timestampedTranscript || response?.textOrTranscript || ''}
                     onChange={(e) => handleUpdateText(block.id, e.target.value)}
                     rows={4}
-                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-primary-400"
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs font-mono text-slate-800"
                   />
                 </div>
-
-                {feedback && (
-                  <div className="space-y-4 pt-2 border-t border-slate-100">
-                    {Object.keys(feedback.subscores).length > 0 && (
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                        {Object.entries(feedback.subscores).map(([key, val]) => (
-                          <div key={key} className="bg-slate-50 rounded-lg p-2.5 border border-slate-100">
-                            <p className="text-xs text-slate-500 capitalize">{key.replace(/_/g, ' ')}</p>
-                            <p className="text-lg font-bold text-primary-600">{val}</p>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-
-                    {feedback.suggestedFix && (
-                      <div className="bg-primary-50 border border-primary-200 rounded-xl p-3.5">
-                        <p className="text-xs font-bold text-primary-800 mb-1">
-                          ✨ 145–155 Band Suggested Upgrade
-                        </p>
-                        <p className="text-xs text-slate-800 leading-relaxed">
-                          {feedback.suggestedFix}
-                        </p>
-                      </div>
-                    )}
-
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
-                      {feedback.strengths.length > 0 && (
-                        <div className="bg-green-50 rounded-lg p-3">
-                          <p className="font-bold text-green-800 mb-1.5">✓ Strengths</p>
-                          <ul className="space-y-1 text-slate-700 list-disc list-inside">
-                            {feedback.strengths.map((s, i) => (
-                              <li key={i}>{s}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                      {feedback.weaknesses.length > 0 && (
-                        <div className="bg-amber-50 rounded-lg p-3">
-                          <p className="font-bold text-amber-800 mb-1.5">⚠️ Weaknesses</p>
-                          <ul className="space-y-1 text-slate-700 list-disc list-inside">
-                            {feedback.weaknesses.map((w, i) => (
-                              <li key={i}>{w}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                      {feedback.suggestions.length > 0 && (
-                        <div className="bg-blue-50 rounded-lg p-3">
-                          <p className="font-bold text-blue-800 mb-1.5">💡 Actionable Fixes</p>
-                          <ul className="space-y-1 text-slate-700 list-disc list-inside">
-                            {feedback.suggestions.map((sg, i) => (
-                              <li key={i}>{sg}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                    </div>
+                {feedback?.suggestedFix && (
+                  <div className="bg-primary-50 border border-primary-200 rounded-xl p-3.5 text-xs">
+                    <p className="font-bold text-primary-800 mb-1">145–155 Band Suggested Upgrade:</p>
+                    <p className="text-slate-800">{feedback.suggestedFix}</p>
                   </div>
                 )}
               </div>
@@ -332,22 +235,18 @@ export function PostSession() {
         })}
       </div>
 
-      {/* Footer Actions */}
       <div className="mt-8 flex flex-wrap justify-between items-center gap-3">
         <button
           onClick={handleEvaluate}
           disabled={evaluating}
-          className="px-4 py-2 text-sm font-semibold text-primary-700 bg-primary-50 border border-primary-200 rounded-lg hover:bg-primary-100 disabled:opacity-50"
+          className="px-4 py-2 text-sm font-semibold text-primary-700 bg-primary-50 border border-primary-200 rounded-lg"
         >
-          {evaluating ? 'Re-evaluating...' : '↻ Re-evaluate Responses with AI'}
+          {evaluating ? 'Re-evaluating...' : 'Re-evaluate Responses with AI'}
         </button>
-
         <div className="flex gap-3">
           <button
-            onClick={() => {
-              clearActiveRun();
-            }}
-            className="px-4 py-2.5 text-sm font-semibold text-slate-700 border border-slate-300 rounded-lg hover:bg-white"
+            onClick={() => clearActiveRun()}
+            className="px-4 py-2.5 text-sm font-semibold text-slate-700 border border-slate-300 rounded-lg"
           >
             Start Another Session
           </button>
@@ -357,9 +256,9 @@ export function PostSession() {
               setConfigSection('history');
               setView('config');
             }}
-            className="px-5 py-2.5 bg-slate-900 text-white text-sm font-semibold rounded-lg hover:bg-slate-800"
+            className="px-5 py-2.5 bg-slate-900 text-white text-sm font-semibold rounded-lg"
           >
-            📊 View Score Trends & History
+            View Score Trends & Error Log
           </button>
         </div>
       </div>

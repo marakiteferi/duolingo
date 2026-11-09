@@ -5,6 +5,7 @@ import { useConfigStore } from '../../stores/configStore';
 import { db, ensureDatabaseUpgraded } from '../../db/database';
 import type { SessionRun, DETQuestionType } from '../../types';
 import { formatTime } from '../../utils/helpers';
+import { extractRecurringErrors, type RecurringErrorItem } from '../../utils/errorLog';
 import { WhisperLiveIndicator } from '../common/WhisperLiveIndicator';
 
 export function PreSession() {
@@ -17,13 +18,14 @@ export function PreSession() {
   const setSelectedTemplateId = useSessionStore((s) => s.setSelectedTemplateId);
 
   const [incompleteRun, setIncompleteRun] = useState<SessionRun | null>(null);
+  const [recurringErrors, setRecurringErrors] = useState<RecurringErrorItem[]>([]);
   const [micStatus, setMicStatus] = useState<'unchecked' | 'granted' | 'denied'>('unchecked');
   const [starting, setStarting] = useState(false);
 
-  // User customization states — always configurable for each exam attempt
   const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
   const [customDurations, setCustomDurations] = useState<Record<string, number>>({});
   const [instantFeedback, setInstantFeedback] = useState<boolean>(true);
+  const [communicativePressure, setCommunicativePressure] = useState<boolean>(false);
   const [preferredQuestionType, setPreferredQuestionType] = useState<DETQuestionType | 'all' | 'adaptive'>('adaptive');
 
   const selectedTemplate = templates.find((t) => t.id === selectedTemplateId) ?? null;
@@ -31,12 +33,13 @@ export function PreSession() {
   useEffect(() => {
     ensureDatabaseUpgraded().then(() => loadTemplates());
     db.sessionRuns
-      .where('status')
-      .equals('in-progress')
+      .orderBy('startedAt')
       .reverse()
-      .sortBy('startedAt')
-      .then((inProgress) => {
-        if (inProgress.length > 0) setIncompleteRun(inProgress[0]);
+      .toArray()
+      .then((allRuns) => {
+        const inProg = allRuns.find((r) => r.status === 'in-progress');
+        if (inProg) setIncompleteRun(inProg);
+        setRecurringErrors(extractRecurringErrors(allRuns, 3));
       });
   }, [loadTemplates]);
 
@@ -46,7 +49,6 @@ export function PreSession() {
     }
   }, [templates, selectedTemplateId, setSelectedTemplateId]);
 
-  // Whenever selected template changes, select all its blocks by default
   useEffect(() => {
     if (selectedTemplate) {
       setSelectedBlockIds(selectedTemplate.blocks.map((b) => b.id));
@@ -60,7 +62,7 @@ export function PreSession() {
 
   const activeBlocks =
     selectedTemplate?.blocks.filter((b) => selectedBlockIds.includes(b.id)) ?? [];
-  const hasSpeakingBlock = activeBlocks.some((b) => b.type === 'speaking');
+  const hasSpeakingBlock = activeBlocks.some((b) => b.type === 'speaking' || b.type === 'shadowing');
   const totalSec = activeBlocks.reduce(
     (sum, b) => sum + (customDurations[b.id] ?? b.durationSec),
     0
@@ -89,6 +91,7 @@ export function PreSession() {
       selectedBlockIds,
       customDurations,
       instantFeedback,
+      communicativePressure,
       preferredQuestionType,
     });
   };
@@ -104,29 +107,51 @@ export function PreSession() {
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-8">
-      {/* Top Back Navigation Bar */}
       <div className="flex items-center justify-between mb-6 pb-4 border-b border-slate-200">
         <button
           type="button"
           onClick={() => setView('config')}
-          className="flex items-center gap-2 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 px-3.5 py-2 rounded-lg shadow-2xs transition-colors cursor-pointer"
+          className="flex items-center gap-2 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 px-3.5 py-2 rounded-lg cursor-pointer"
         >
-          <svg className="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-          </svg>
           ← Back to Dashboard
         </button>
-        <span className="text-xs text-slate-400 font-medium">
-          Step 1: Choose Your Practice Mode
-        </span>
+        <WhisperLiveIndicator />
       </div>
 
-      {/* Interrupted Session Banner */}
+      {/* SLA Priming: Recurring Error Log */}
+      {recurringErrors.length > 0 && (
+        <div className="mb-6 bg-amber-50 border-2 border-amber-200 rounded-xl p-4 space-y-2">
+          <div className="flex items-center justify-between">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-amber-900">
+              Pre-Session Cognitive Priming: Top Recurring Error Log
+            </h3>
+            <span className="text-[11px] font-semibold text-amber-700">
+              Consciously monitor these during output
+            </span>
+          </div>
+          <ul className="space-y-1.5">
+            {recurringErrors.map((err, i) => (
+              <li key={i} className="text-xs text-slate-800 flex items-start justify-between gap-2 bg-white/80 p-2 rounded-lg border border-amber-100">
+                <span>
+                  <strong className="uppercase text-[10px] px-1.5 py-0.5 rounded bg-amber-200 text-amber-900 mr-2">
+                    {err.category}
+                  </strong>
+                  {err.issue}
+                </span>
+                <span className="text-[11px] font-mono font-bold text-amber-800 shrink-0">
+                  {err.count}x
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {incompleteRun && (
-        <div className="mb-8 bg-amber-50 border border-amber-200 rounded-xl p-5 flex flex-wrap items-center justify-between gap-4">
+        <div className="mb-6 bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h3 className="font-semibold text-amber-900">⚠️ Incomplete Session Found</h3>
-            <p className="text-xs text-amber-700 mt-0.5">
+            <h3 className="font-semibold text-amber-900">Incomplete Session Found</h3>
+            <p className="text-xs text-amber-700">
               Started {new Date(incompleteRun.startedAt).toLocaleString()} • Block{' '}
               {incompleteRun.currentBlockIndex + 1} of {incompleteRun.blockConfigs.length}
             </p>
@@ -136,7 +161,7 @@ export function PreSession() {
               onClick={() => resumeSession(incompleteRun)}
               className="px-4 py-2 bg-amber-600 text-white text-xs font-semibold rounded-lg hover:bg-amber-700"
             >
-              ▶ Resume Session
+              Resume Session
             </button>
             <button
               onClick={handleDiscardIncomplete}
@@ -148,20 +173,10 @@ export function PreSession() {
         </div>
       )}
 
-      <div className="flex flex-wrap items-center justify-between gap-2 mb-6">
-        <div>
-          <h2 className="text-2xl font-bold text-slate-900">Configure & Start Practice</h2>
-          <p className="text-sm text-slate-500">
-            Choose a full template or select individual blocks, question types, and feedback mode.
-          </p>
-        </div>
-        <WhisperLiveIndicator />
-      </div>
-
       {/* 1. Template Picker */}
       <div className="mb-6">
         <label className="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">
-          1. Select Session Template
+          1. Select Practice Protocol / Template
         </label>
         <div className="grid gap-3">
           {templates.map((t) => (
@@ -183,46 +198,26 @@ export function PreSession() {
               <div className="flex-1">
                 <div className="flex items-center justify-between">
                   <p className="font-semibold text-slate-900">{t.name}</p>
-                  <span className="text-xs font-mono text-slate-500">
-                    {t.blocks.length} blocks
-                  </span>
+                  <span className="text-xs font-mono text-slate-500">{t.blocks.length} blocks</span>
                 </div>
-                {t.description && (
-                  <p className="text-xs text-slate-500 mt-0.5">{t.description}</p>
-                )}
+                {t.description && <p className="text-xs text-slate-500 mt-0.5">{t.description}</p>}
               </div>
             </label>
           ))}
         </div>
       </div>
 
-      {/* 2. Choose Full or Partial Blocks + Custom Durations */}
+      {/* 2. Select Blocks */}
       {selectedTemplate && (
         <div className="mb-6 bg-white rounded-xl border border-slate-200 p-5">
           <div className="flex items-center justify-between mb-3">
-            <div>
-              <h3 className="text-sm font-bold text-slate-800">
-                2. Select Blocks to Run ({activeBlocks.length} of {selectedTemplate.blocks.length} selected)
-              </h3>
-              <p className="text-xs text-slate-500">
-                Uncheck any block if you only want to drill specific parts today.
-              </p>
-            </div>
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => setSelectedBlockIds(selectedTemplate.blocks.map((b) => b.id))}
-                className="text-xs text-primary-600 hover:underline font-medium"
-              >
-                Select All
-              </button>
-              <span className="text-slate-300">|</span>
-              <span className="text-xs font-mono font-semibold text-slate-700">
-                Total: {formatTime(totalSec)}
-              </span>
-            </div>
+            <h3 className="text-sm font-bold text-slate-800">
+              2. Select Blocks to Run ({activeBlocks.length} of {selectedTemplate.blocks.length})
+            </h3>
+            <span className="text-xs font-mono font-semibold text-slate-700">
+              Total: {formatTime(totalSec)}
+            </span>
           </div>
-
           <div className="space-y-2">
             {selectedTemplate.blocks.map((b, i) => {
               const checked = selectedBlockIds.includes(b.id);
@@ -230,8 +225,8 @@ export function PreSession() {
               return (
                 <div
                   key={b.id}
-                  className={`flex items-center justify-between p-3 rounded-lg border transition-colors ${
-                    checked ? 'bg-slate-50 border-slate-200' : 'bg-slate-50/40 border-slate-100 opacity-50'
+                  className={`flex items-center justify-between p-3 rounded-lg border ${
+                    checked ? 'bg-slate-50 border-slate-200' : 'opacity-50 border-slate-100'
                   }`}
                 >
                   <label className="flex items-center gap-3 cursor-pointer flex-1">
@@ -239,19 +234,14 @@ export function PreSession() {
                       type="checkbox"
                       checked={checked}
                       onChange={() => toggleBlockSelection(b.id)}
-                      className="rounded text-primary-600 focus:ring-primary-500"
                     />
-                    <span className="w-5 h-5 rounded-full bg-slate-200 text-slate-700 text-xs flex items-center justify-center font-bold">
-                      {i + 1}
+                    <span className="text-sm font-semibold text-slate-800">
+                      {i + 1}. {b.name}
                     </span>
-                    <div>
-                      <span className="text-sm font-semibold text-slate-800">{b.name}</span>
-                      <span className="ml-2 text-xs px-2 py-0.5 rounded bg-slate-200 text-slate-600">
-                        {b.type}
-                      </span>
-                    </div>
+                    <span className="text-xs px-2 py-0.5 rounded bg-slate-200 text-slate-600">
+                      {b.type}
+                    </span>
                   </label>
-
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
@@ -275,57 +265,40 @@ export function PreSession() {
         </div>
       )}
 
-      {/* 3. Feedback Mode & Question Type Filter */}
+      {/* 3. Feedback Mode & Communicative Pressure */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-        <div className="bg-white rounded-xl border border-slate-200 p-4">
-          <label className="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">
-            3. AI Feedback Timing
+        <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3">
+          <label className="block text-xs font-bold uppercase tracking-wider text-slate-500">
+            3. Deliberate Practice & Pressure Settings
           </label>
-          <div className="space-y-2.5">
-            <label
-              className={`flex items-start gap-3 p-3 rounded-xl border-2 cursor-pointer transition-all ${
-                instantFeedback
-                  ? 'border-primary-500 bg-primary-50/70 shadow-2xs'
-                  : 'border-slate-200 bg-white hover:border-slate-300'
-              }`}
-            >
-              <input
-                type="radio"
-                name="feedbackMode"
-                checked={instantFeedback}
-                onChange={() => setInstantFeedback(true)}
-                className="mt-1 text-primary-600 focus:ring-primary-500"
-              />
-              <div>
-                <p className="text-sm font-bold text-slate-900">⚡ Instant Per-Block Feedback</p>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Request AI score & 145+ fix after each block (timer automatically pauses during review).
-                </p>
-              </div>
-            </label>
-
-            <label
-              className={`flex items-start gap-3 p-3 rounded-xl border-2 cursor-pointer transition-all ${
-                !instantFeedback
-                  ? 'border-primary-500 bg-primary-50/70 shadow-2xs'
-                  : 'border-slate-200 bg-white hover:border-slate-300'
-              }`}
-            >
-              <input
-                type="radio"
-                name="feedbackMode"
-                checked={!instantFeedback}
-                onChange={() => setInstantFeedback(false)}
-                className="mt-1 text-primary-600 focus:ring-primary-500"
-              />
-              <div>
-                <p className="text-sm font-bold text-slate-900">🎯 Full Exam Simulation Mode</p>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Realistic test pacing without interruptions. Review all composite scores at the end.
-                </p>
-              </div>
-            </label>
-          </div>
+          <label className="flex items-start gap-2.5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={instantFeedback}
+              onChange={(e) => setInstantFeedback(e.target.checked)}
+              className="mt-1"
+            />
+            <div>
+              <p className="text-sm font-semibold text-slate-800">Instant Write-Critique-Rewrite Loop</p>
+              <p className="text-xs text-slate-500">
+                Grade immediately & unlock the "Apply Fixes & Rewrite/Re-record" button.
+              </p>
+            </div>
+          </label>
+          <label className="flex items-start gap-2.5 cursor-pointer pt-2 border-t border-slate-100">
+            <input
+              type="checkbox"
+              checked={communicativePressure}
+              onChange={(e) => setCommunicativePressure(e.target.checked)}
+              className="mt-1 accent-red-600"
+            />
+            <div>
+              <p className="text-sm font-bold text-red-700">Strict Communicative Pressure Mode</p>
+              <p className="text-xs text-slate-500">
+                Disables Backspace/Delete in writing and hides Stop in speaking until timer ends.
+              </p>
+            </div>
+          </label>
         </div>
 
         <div className="bg-white rounded-xl border border-slate-200 p-4">
@@ -339,16 +312,15 @@ export function PreSession() {
             }
             className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-medium text-slate-800 mb-2"
           >
-            <option value="adaptive">⚡ Adaptive + SRS Due First (Recommended)</option>
+            <option value="adaptive">Adaptive + SRS Due First (Recommended)</option>
             <option value="all">All Question Types</option>
-            <option value="interactive-writing">✍️ Interactive Writing Only</option>
-            <option value="write-about-photo">🖼️ Write About Photo Only</option>
-            <option value="speaking-sample">🎤 Speaking Sample Only</option>
-            <option value="interactive-speaking">🗣️ Interactive Speaking Only</option>
-            <option value="read-aloud">📖 Read Aloud Only</option>
-            <option value="listen-and-type">🎧 Listen & Type Only</option>
+            <option value="interactive-writing">Interactive Writing Only</option>
+            <option value="write-about-photo">Write About Photo Only</option>
+            <option value="speaking-sample">Speaking Sample Only</option>
+            <option value="interactive-speaking">Interactive Speaking Only</option>
+            <option value="read-aloud">Read Aloud / Shadowing Only</option>
+            <option value="listen-and-type">Listen & Type / Dictogloss Only</option>
           </select>
-
           {hasSpeakingBlock && (
             <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
               <span className="text-xs text-slate-600">Microphone Status:</span>
@@ -368,15 +340,14 @@ export function PreSession() {
         </div>
       </div>
 
-      {/* Start Button */}
       <button
         onClick={handleStart}
         disabled={!selectedTemplate || activeBlocks.length === 0 || starting}
-        className="w-full py-4 bg-primary-600 text-white text-base font-bold rounded-xl hover:bg-primary-700 disabled:opacity-50 transition-colors cursor-pointer shadow-sm"
+        className="w-full py-4 bg-primary-600 text-white text-base font-bold rounded-xl hover:bg-primary-700 disabled:opacity-50 cursor-pointer shadow-sm"
       >
         {starting
           ? 'Starting Session...'
-          : `▶ Start Practice (${activeBlocks.length} Block${activeBlocks.length === 1 ? '' : 's'} • ${formatTime(totalSec)})`}
+          : `Start Practice (${activeBlocks.length} Block${activeBlocks.length === 1 ? '' : 's'} • ${formatTime(totalSec)})`}
       </button>
     </div>
   );

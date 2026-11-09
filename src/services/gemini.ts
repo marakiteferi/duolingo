@@ -9,8 +9,13 @@ export interface EvaluateParams {
   variables: Record<string, string>;
 }
 
-const RETRY_DELAY_MS = 2_000;
-const REQUEST_TIMEOUT_MS = 35_000;
+const FALLBACK_MODELS = [
+  'gemini-3.5-flash-lite',
+  'gemini-3.8-flash',
+  'gemini-3.1-flash-lite',
+];
+const RETRY_DELAY_MS = 1_500;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 function interpolateTemplate(
   template: string,
@@ -19,12 +24,9 @@ function interpolateTemplate(
   let output = template.replace(/\{\{(\w+)\}\}/g, (match, key: string) => {
     return key in vars ? vars[key] : match;
   });
-
-  // Safety guarantee: if the user's template didn't include {{response}} or {{transcript}},
-  // append the prompt and student response automatically so Gemini always sees it.
-  const studentText = vars.response || vars.transcript || '';
+  const studentText = vars.transcript || vars.response || '';
   if (studentText && !template.includes('{{response}}') && !template.includes('{{transcript}}')) {
-    output += `\n\n---\nTask Prompt: ${vars.prompt ?? ''}\nDuration: ${vars.durationSec ?? 0}s\nStudent Response:\n${studentText}`;
+    output += `\n\n---\nTask Prompt: ${vars.prompt ?? ''}\nVerified Audio/Task Duration: ${vars.durationSec ?? 0} seconds\nStudent Output:\n${studentText}`;
   }
   return output;
 }
@@ -34,7 +36,6 @@ function validateEvaluationResult(data: unknown): AIFeedback {
     throw new Error('Gemini returned a non-object response.');
   }
   const obj = data as Record<string, unknown>;
-
   const toNumericRecord = (val: unknown): Record<string, number> => {
     if (typeof val !== 'object' || val === null) return {};
     return Object.fromEntries(
@@ -43,7 +44,6 @@ function validateEvaluationResult(data: unknown): AIFeedback {
         .map(([k, v]) => [k, Math.round(v as number)])
     );
   };
-
   const subscores = toNumericRecord(obj.subscores ?? obj.subscore_breakdown);
   const criteria: Record<string, string> = {};
   if (typeof obj.criteria === 'object' && obj.criteria !== null) {
@@ -52,29 +52,24 @@ function validateEvaluationResult(data: unknown): AIFeedback {
       else if (typeof v === 'number' && !(k in subscores)) subscores[k] = Math.round(v);
     }
   }
-
   const toStringArray = (val: unknown): string[] => {
     if (!Array.isArray(val)) return [];
     return val.filter((item): item is string => typeof item === 'string');
   };
-
   const subValues = Object.values(subscores);
   const computedAvg =
     subValues.length > 0
       ? Math.round(subValues.reduce((a, b) => a + b, 0) / subValues.length)
       : undefined;
-
   const overallScore =
     typeof obj.overallScore === 'number'
       ? Math.round(obj.overallScore)
       : computedAvg;
-
   const suggestions = toStringArray(obj.suggestions);
   const suggestedFix = typeof obj.suggestedFix === 'string' ? obj.suggestedFix : undefined;
   if (suggestedFix && !suggestions.includes(suggestedFix)) {
     suggestions.unshift(`145+ Rewrite: ${suggestedFix}`);
   }
-
   return {
     overallScore,
     subscores,
@@ -99,57 +94,54 @@ export async function evaluateResponse(params: EvaluateParams): Promise<AIFeedba
 
   const prompt = interpolateTemplate(evalPromptTemplate, variables);
   let lastError: Error | null = null;
-  const maxRetriesPerModel = 2; 
-  
-  // Try user's preferred primary model first, with automatic fallback
-  const modelsToTry = [
-    'gemini-3.5-flash-lite',
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-1.5-flash',
-  ];
+  const maxRetriesPerModel = 1;
 
-  for (const currentModel of modelsToTry) {
+  for (const currentModel of FALLBACK_MODELS) {
     for (let attempt = 0; attempt <= maxRetriesPerModel; attempt++) {
       try {
-        return await callGemini(apiKey, prompt, currentModel); 
+        return await callGemini(apiKey, prompt, currentModel);
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
         const msg = lastError.message.toLowerCase();
-        
-        // 1. Hard fail on auth/permission issues (kill everything)
+
+        // 1. Hard fail on invalid API key or permission errors
         if (msg.includes('api key') || msg.includes('permission') || msg.includes('forbidden')) {
-          throw lastError; 
-        }
-        
-        // 2. Immediate fallback on 404 or deprecated model (skip retries, jump to next model)
-        if (msg.includes('404') || msg.includes('not found') || msg.includes('no longer available') || msg.includes('invalid')) {
-          console.warn(`Model ${currentModel} unavailable. Falling back instantly...`);
-          break; 
+          throw lastError;
         }
 
-        // 3. Retry with backoff on 503/429 Server Busy
+        // 2. Immediate zero-delay failover if model is 404/deprecated/unavailable/quota-exhausted
+        if (
+          msg.includes('404') ||
+          msg.includes('not found') ||
+          msg.includes('no longer available') ||
+          msg.includes('invalid') ||
+          msg.includes('429') ||
+          msg.includes('quota')
+        ) {
+          console.warn(`Model ${currentModel} unavailable or quota reached. Failing over immediately...`);
+          break;
+        }
+
+        // 3. Brief backoff on 503 high demand before trying next model
         if (attempt < maxRetriesPerModel) {
-          const backoffMs = RETRY_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000;
-          console.warn(`Gemini API busy (${currentModel}). Retrying in ${Math.round(backoffMs/1000)}s...`);
+          const backoffMs = RETRY_DELAY_MS * Math.pow(2, attempt) + Math.random() * 400;
+          console.warn(`Model ${currentModel} busy (503). Retrying in ${Math.round(backoffMs)}ms...`);
           await delay(backoffMs);
         }
       }
     }
   }
-  
-  throw new Error(`Gemini evaluation failed after trying all fallback models: ${lastError?.message ?? 'Unknown error'}`);
+
+  throw new Error(`Gemini evaluation failed across all models: ${lastError?.message ?? 'Unknown error'}`);
 }
 
-// 2. Add the 'modelName' parameter to callGemini
 async function callGemini(apiKey: string, prompt: string, modelName: string): Promise<AIFeedback> {
   const genAI = new GoogleGenerativeAI(apiKey);
-  
-  // Initialize the specific model passed from the loop above
   const model = genAI.getGenerativeModel({
-    model: modelName, 
+    model: modelName,
     generationConfig: {
       responseMimeType: 'application/json',
+      temperature: 0.1,
     },
   });
 
@@ -161,17 +153,14 @@ async function callGemini(apiKey: string, prompt: string, modelName: string): Pr
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
     });
     clearTimeout(timeoutId);
-
     const text = result.response.text();
     if (!text) throw new Error('Gemini returned an empty response.');
-
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
     } catch {
       throw new Error(`Failed to parse Gemini JSON: ${text.slice(0, 160)}`);
     }
-
     return validateEvaluationResult(parsed);
   } catch (error) {
     clearTimeout(timeoutId);

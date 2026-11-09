@@ -12,14 +12,14 @@ export type BlockType =
   | 'brain-dump'
   | 'vocab-writing'
   | 'speaking'
+  | 'shadowing'
+  | 'dictogloss'
   | 'mock-test'
   | 'custom';
 
 export type STTProvider = 'local-whisper' | 'whisper' | 'web-speech-api';
-
 export type ViewMode = 'config' | 'exam';
 export type AppView = ViewMode;
-
 export type SessionStatus = 'in-progress' | 'completed' | 'abandoned';
 export type ScoreScale = 'det-0-160' | 'custom';
 export type ConfigSection = 'templates' | 'questions' | 'eval-prompts' | 'history' | 'settings';
@@ -54,6 +54,8 @@ export interface QuestionBankItem {
   type: DETQuestionType;
   prompt: string;
   sampleAnswer?: string;
+  targetChunks?: string[];
+  sourceAudioText?: string;
   difficulty: number | 'easy' | 'mid' | 'hard';
   tags: string[];
   srs?: SRSData;
@@ -111,6 +113,9 @@ export interface BlockResponse {
   textOrTranscript?: string;
   timestampedTranscript?: string;
   audioDurationSec?: number;
+  fragmentNotes?: string;
+  attemptCount?: number;
+  previousDraft?: string;
   audioBlobRef?: string;
   isComplete: boolean;
   timeSpentSec: number;
@@ -137,6 +142,7 @@ export interface SessionRun {
   currentBlockIndex: number;
   overallElapsedSec: number;
   instantFeedback?: boolean;
+  communicativePressure?: boolean;
   preferredQuestionType?: DETQuestionType | 'all' | 'adaptive';
   startedAt: string;
   endedAt: string | null;

@@ -13,6 +13,7 @@ export interface StartSessionOptions {
   selectedBlockIds?: string[];
   customDurations?: Record<string, number>;
   instantFeedback?: boolean;
+  communicativePressure?: boolean;
   preferredQuestionType?: DETQuestionType | 'all' | 'adaptive';
 }
 
@@ -37,6 +38,7 @@ interface SessionActions {
   jumpToBlock: (index: number) => void;
   completeBlock: () => void;
   updateResponse: (blockId: string, patch: Partial<BlockResponse>) => void;
+  resetBlockForRewrite: (blockId: string) => void;
   pauseSession: () => void;
   resumeRunning: () => void;
   completeSession: () => Promise<void>;
@@ -55,6 +57,7 @@ function emptyResponse(block: BlockConfig): BlockResponse {
     questionType: block.preferredQuestionType ?? block.type,
     isComplete: false,
     timeSpentSec: 0,
+    attemptCount: 1,
   };
 }
 
@@ -99,10 +102,9 @@ export const useSessionStore = create<SessionState & SessionActions>()(
           ...b,
           durationSec: options?.customDurations?.[b.id] ?? b.durationSec,
         }));
-
-      const blockConfigs = filteredBlocks.length > 0 ? filteredBlocks : template.blocks.map((b) => ({ ...b }));
+      const blockConfigs =
+        filteredBlocks.length > 0 ? filteredBlocks : template.blocks.map((b) => ({ ...b }));
       const responses = buildResponses(blockConfigs);
-
       const run: SessionRun = {
         id: uuidv4(),
         templateId: template.id,
@@ -112,12 +114,12 @@ export const useSessionStore = create<SessionState & SessionActions>()(
         currentBlockIndex: 0,
         status: 'in-progress',
         overallElapsedSec: 0,
-        instantFeedback: options?.instantFeedback ?? false,
+        instantFeedback: options?.instantFeedback ?? true,
+        communicativePressure: options?.communicativePressure ?? false,
         preferredQuestionType: options?.preferredQuestionType ?? 'adaptive',
         startedAt: now,
         endedAt: null,
       };
-
       await db.sessionRuns.put(run);
       set({
         activeRun: run,
@@ -151,7 +153,6 @@ export const useSessionStore = create<SessionState & SessionActions>()(
     tick: () => {
       const state = get();
       if (!state.isRunning || state.isPaused || !state.activeRun) return;
-
       if (state.transitionCountdown !== null) {
         if (state.transitionCountdown <= 1) {
           set({ transitionCountdown: null, blockElapsedSec: 0 });
@@ -160,20 +161,15 @@ export const useSessionStore = create<SessionState & SessionActions>()(
         }
         return;
       }
-
       const block = state.activeRun.blockConfigs[state.currentBlockIndex];
       if (!block) return;
-
-      // If block has already reached duration and autoAdvance is false, wait for user
       if (state.blockElapsedSec >= block.durationSec && !block.autoAdvance) {
         return;
       }
-
       const newBlockElapsed = state.blockElapsedSec + 1;
       const newOverall = state.overallElapsedSec + 1;
       const isLastBlock =
         state.currentBlockIndex >= state.activeRun.blockConfigs.length - 1;
-
       const updatedResponses = {
         ...state.draftResponses,
         [block.id]: {
@@ -181,15 +177,12 @@ export const useSessionStore = create<SessionState & SessionActions>()(
           timeSpentSec: newBlockElapsed,
         },
       };
-
       if (newBlockElapsed >= block.durationSec) {
         updatedResponses[block.id] = {
           ...updatedResponses[block.id],
           isComplete: true,
           timeSpentSec: block.durationSec,
         };
-
-        // Respect autoAdvance=false: stop advancing and let user finish/inspect feedback
         if (!block.autoAdvance) {
           set({
             blockElapsedSec: block.durationSec,
@@ -199,7 +192,6 @@ export const useSessionStore = create<SessionState & SessionActions>()(
           void get().persistToDb();
           return;
         }
-
         if (isLastBlock) {
           set({
             blockElapsedSec: block.durationSec,
@@ -210,7 +202,6 @@ export const useSessionStore = create<SessionState & SessionActions>()(
           void get().completeSession();
           return;
         }
-
         set({
           currentBlockIndex: state.currentBlockIndex + 1,
           blockElapsedSec: 0,
@@ -221,24 +212,20 @@ export const useSessionStore = create<SessionState & SessionActions>()(
         void get().persistToDb();
         return;
       }
-
       set({
         blockElapsedSec: newBlockElapsed,
         overallElapsedSec: newOverall,
         draftResponses: updatedResponses,
       });
-
       if (newOverall % 5 === 0) void get().persistToDb();
     },
 
     advanceBlock: () => {
       const state = get();
       if (!state.activeRun) return;
-
       const isLast =
         state.currentBlockIndex >= state.activeRun.blockConfigs.length - 1;
       const block = state.activeRun.blockConfigs[state.currentBlockIndex];
-
       if (block) {
         set({
           draftResponses: {
@@ -251,12 +238,10 @@ export const useSessionStore = create<SessionState & SessionActions>()(
           },
         });
       }
-
       if (isLast) {
         void get().completeSession();
         return;
       }
-
       set({
         currentBlockIndex: state.currentBlockIndex + 1,
         blockElapsedSec: 0,
@@ -302,11 +287,40 @@ export const useSessionStore = create<SessionState & SessionActions>()(
         blockId,
         isComplete: false,
         timeSpentSec: get().blockElapsedSec,
+        attemptCount: 1,
       };
       set({
         draftResponses: {
           ...get().draftResponses,
           [blockId]: { ...existing, ...patch },
+        },
+      });
+      void get().persistToDb();
+    },
+
+    resetBlockForRewrite: (blockId) => {
+      const state = get();
+      const existing = state.draftResponses[blockId];
+      if (!existing) return;
+      const nextAttempt = (existing.attemptCount ?? 1) + 1;
+      set({
+        blockElapsedSec: 0,
+        isPaused: false,
+        draftResponses: {
+          ...state.draftResponses,
+          [blockId]: {
+            ...existing,
+            previousDraft: existing.textOrTranscript || existing.previousDraft,
+            textOrTranscript: '',
+            timestampedTranscript: undefined,
+            audioBlobRef: undefined,
+            audioDurationSec: undefined,
+            wpm: undefined,
+            fillerCount: undefined,
+            isComplete: false,
+            timeSpentSec: 0,
+            attemptCount: nextAttempt,
+          },
         },
       });
       void get().persistToDb();
@@ -318,7 +332,6 @@ export const useSessionStore = create<SessionState & SessionActions>()(
     completeSession: async () => {
       const state = get();
       if (!state.activeRun) return;
-
       const completed: SessionRun = {
         ...state.activeRun,
         responses: { ...state.draftResponses },
@@ -330,7 +343,6 @@ export const useSessionStore = create<SessionState & SessionActions>()(
           durationSec: state.overallElapsedSec,
         },
       };
-
       await db.sessionRuns.put(completed);
       set({
         activeRun: completed,
@@ -382,27 +394,21 @@ export const useSessionStore = create<SessionState & SessionActions>()(
 );
 
 type S = SessionState;
-
 export const selectCurrentBlock = (s: S): BlockConfig | undefined =>
   s.activeRun?.blockConfigs[s.currentBlockIndex];
-
 export const selectIsLastBlock = (s: S): boolean =>
   !s.activeRun ? false : s.currentBlockIndex >= s.activeRun.blockConfigs.length - 1;
-
 export const selectBlockTimeRemaining = (s: S): number => {
   const block = s.activeRun?.blockConfigs[s.currentBlockIndex];
   if (!block) return 0;
   return Math.max(0, block.durationSec - s.blockElapsedSec);
 };
-
 export const selectTotalDuration = (s: S): number =>
   s.activeRun?.blockConfigs.reduce((sum, b) => sum + b.durationSec, 0) ?? 0;
-
 export const selectOverallProgress = (s: S): number => {
   const total = selectTotalDuration(s);
   return total === 0 ? 0 : Math.min(1, s.overallElapsedSec / total);
 };
-
 export const selectBlockProgress = (s: S): number => {
   const block = s.activeRun?.blockConfigs[s.currentBlockIndex];
   if (!block || block.durationSec === 0) return 0;

@@ -16,9 +16,6 @@ const LOCAL_WHISPER_HEALTH_URL = 'http://127.0.0.1:8000/health';
 const OPENAI_WHISPER_API_URL = 'https://api.openai.com/v1/audio/transcriptions';
 const MAX_BLOB_SIZE_BYTES = 24 * 1024 * 1024;
 
-/**
- * Checks whether the local Python FastAPI faster-whisper server is online.
- */
 export async function checkLocalWhisperHealth(
   transcribeUrl: string = LOCAL_WHISPER_DEFAULT_URL
 ): Promise<boolean> {
@@ -29,7 +26,6 @@ export async function checkLocalWhisperHealth(
     const res = await fetch(`${baseUrl}/health`, { signal: controller.signal });
     clearTimeout(timer);
     if (res.ok) return true;
-    // Even if /health isn't added yet, a 404 from uvicorn means the server is up!
     return res.status === 404;
   } catch {
     try {
@@ -44,9 +40,6 @@ export async function checkLocalWhisperHealth(
   }
 }
 
-/**
- * Analyzes a verbatim transcript for filler words, hesitations, and WPM.
- */
 export function analyzeSpeechTranscript(text: string, durationSec: number): {
   wordCount: number;
   fillerCount: number;
@@ -63,7 +56,6 @@ export function analyzeSpeechTranscript(text: string, durationSec: number): {
   const matches = clean.match(fillerRegex) ?? [];
   const minutes = Math.max(0.1, durationSec / 60);
   const wpm = Math.round(wordCount / minutes);
-
   return {
     wordCount,
     fillerCount: matches.length,
@@ -72,27 +64,20 @@ export function analyzeSpeechTranscript(text: string, durationSec: number): {
   };
 }
 
-/**
- * Primary Provider: Local Faster-Whisper running on RTX 3050 (http://127.0.0.1:8000/transcribe)
- */
 export class LocalWhisperSTTProvider implements STTProvider {
   private readonly endpointUrl: string;
-
   constructor(endpointUrl: string = LOCAL_WHISPER_DEFAULT_URL) {
     this.endpointUrl = endpointUrl || LOCAL_WHISPER_DEFAULT_URL;
   }
-
   isAvailable(): boolean {
     return true;
   }
-
   async transcribe(audioBlob: Blob): Promise<STTResult> {
     const audioFile = new File([audioBlob], 'recording.webm', {
       type: audioBlob.type || 'audio/webm',
     });
     const formData = new FormData();
     formData.append('file', audioFile);
-
     let response: Response;
     try {
       response = await fetch(this.endpointUrl, {
@@ -106,39 +91,34 @@ export class LocalWhisperSTTProvider implements STTProvider {
           '. Make sure your Python terminal (python app.py) is running on port 8000.'
       );
     }
-
     if (!response.ok) {
       const errText = await response.text().catch(() => 'Unknown server error');
       throw new Error(`Local Whisper error (${response.status}): ${errText}`);
     }
-
     const data = (await response.json()) as {
       text?: string;
       timestampedText?: string;
       duration?: number;
     };
+    if (typeof data.text !== 'string') {
+      throw new Error('Local Whisper returned an unexpected JSON payload.');
+    }
     return {
-      text: data.text ?? '',
-      timestampedText: data.timestampedText,
-      durationSec: data.duration,
+      text: data.text,
+      timestampedText: data.timestampedText || data.text,
+      durationSec: typeof data.duration === 'number' ? data.duration : undefined,
     };
   }
 }
 
-/**
- * Optional Cloud OpenAI Whisper Provider
- */
 export class WhisperSTTProvider implements STTProvider {
   private readonly apiKey: string;
-
   constructor(apiKey: string) {
     this.apiKey = apiKey;
   }
-
   isAvailable(): boolean {
     return this.apiKey.length > 0;
   }
-
   async transcribe(audioBlob: Blob, language: string = 'en'): Promise<STTResult> {
     if (audioBlob.size > MAX_BLOB_SIZE_BYTES) {
       throw new Error('Audio exceeds 24 MB limit.');
@@ -149,13 +129,11 @@ export class WhisperSTTProvider implements STTProvider {
     formData.append('model', 'whisper-1');
     formData.append('language', language);
     formData.append('prompt', 'Uh, um, like, so yeah, well, [cough], [silent]...');
-
     const response = await fetch(OPENAI_WHISPER_API_URL, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.apiKey}` },
       body: formData,
     });
-
     if (!response.ok) {
       throw new Error(`OpenAI Whisper error (${response.status})`);
     }
@@ -164,18 +142,16 @@ export class WhisperSTTProvider implements STTProvider {
   }
 }
 
-/**
- * Browser Web Speech API Fallback
- */
 export class WebSpeechSTTProvider implements STTProvider {
   isAvailable(): boolean {
     return (
       typeof window !== 'undefined' &&
-      Boolean((window as unknown as Record<string, unknown>).SpeechRecognition ||
-              (window as unknown as Record<string, unknown>).webkitSpeechRecognition)
+      Boolean(
+        (window as unknown as Record<string, unknown>).SpeechRecognition ||
+          (window as unknown as Record<string, unknown>).webkitSpeechRecognition
+      )
     );
   }
-
   async transcribe(_audioBlob: Blob): Promise<STTResult> {
     throw new Error(
       'Web Speech API only works in live-streaming mode. Use Local Whisper (port 8000) to transcribe recorded audio blobs.'
