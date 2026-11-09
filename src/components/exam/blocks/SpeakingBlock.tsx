@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useSessionStore, selectBlockTimeRemaining } from '../../../stores/sessionStore';
 import { AudioRecorderService } from '../../../services/audioRecorder';
-import { createSTTProvider, analyzeSpeechTranscript, checkLocalWhisperHealth } from '../../../services/stt';
+import { createSTTProvider, analyzeSpeechTranscript } from '../../../services/stt';
 import { db } from '../../../db/database';
 import { getAdaptiveQuestions } from '../../../utils/adaptive';
 import type { BlockConfig, QuestionBankItem } from '../../../types';
@@ -26,7 +26,6 @@ export function SpeakingBlock({ block }: { block: BlockConfig }) {
   const [error, setError] = useState<string | null>(null);
   const [levels, setLevels] = useState<number[]>(new Array(32).fill(0));
   const [recordingSeconds, setRecordingSeconds] = useState(0);
-  const [whisperOnline, setWhisperOnline] = useState<boolean | null>(null);
   const [prompts, setPrompts] = useState<QuestionBankItem[]>([]);
   const [selectedPromptIdx, setSelectedPromptIdx] = useState(0);
   const [transcribeProgress, setTranscribeProgress] = useState(0);
@@ -40,9 +39,8 @@ export function SpeakingBlock({ block }: { block: BlockConfig }) {
   const response = draftResponses[block.id];
   const transcript = response?.textOrTranscript ?? '';
 
-  // Check local Whisper server status and load speaking prompts
+  // Load speaking prompts
   useEffect(() => {
-    checkLocalWhisperHealth().then(setWhisperOnline);
     getAdaptiveQuestions({
       skill: 'speaking',
       questionType: activeRun?.preferredQuestionType ?? 'adaptive',

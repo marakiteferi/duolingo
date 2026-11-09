@@ -3,7 +3,6 @@ import { useAppStore } from '../../stores/appStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useConfigStore } from '../../stores/configStore';
 import { db, ensureDatabaseUpgraded } from '../../db/database';
-import { checkLocalWhisperHealth } from '../../services/stt';
 import type { SessionRun, DETQuestionType } from '../../types';
 import { formatTime } from '../../utils/helpers';
 import { WhisperLiveIndicator } from '../common/WhisperLiveIndicator';
@@ -19,7 +18,6 @@ export function PreSession() {
 
   const [incompleteRun, setIncompleteRun] = useState<SessionRun | null>(null);
   const [micStatus, setMicStatus] = useState<'unchecked' | 'granted' | 'denied'>('unchecked');
-  const [whisperOnline, setWhisperOnline] = useState<boolean | null>(null);
   const [starting, setStarting] = useState(false);
 
   // User customization states — always configurable for each exam attempt
@@ -32,7 +30,6 @@ export function PreSession() {
 
   useEffect(() => {
     ensureDatabaseUpgraded().then(() => loadTemplates());
-    checkLocalWhisperHealth().then(setWhisperOnline);
     db.sessionRuns
       .where('status')
       .equals('in-progress')
