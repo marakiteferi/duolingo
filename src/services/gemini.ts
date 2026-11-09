@@ -101,8 +101,13 @@ export async function evaluateResponse(params: EvaluateParams): Promise<AIFeedba
   let lastError: Error | null = null;
   const maxRetriesPerModel = 2; 
   
-  // Try fastest/newest models first, fall back to older stables
-  const modelsToTry = ['gemini-3.8-flash', 'gemini-3.6-flash'];
+  // Try user's preferred primary model first, with automatic fallback
+  const modelsToTry = [
+    'gemini-3.5-flash-lite',
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
+  ];
 
   for (const currentModel of modelsToTry) {
     for (let attempt = 0; attempt <= maxRetriesPerModel; attempt++) {
