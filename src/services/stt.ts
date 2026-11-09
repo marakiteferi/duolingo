@@ -1,7 +1,13 @@
 import type { STTProvider as STTProviderType } from '../types';
 
+export interface STTResult {
+  text: string;
+  timestampedText?: string;
+  durationSec?: number;
+}
+
 export interface STTProvider {
-  transcribe(audioBlob: Blob, language?: string): Promise<string>;
+  transcribe(audioBlob: Blob, language?: string): Promise<STTResult>;
   isAvailable(): boolean;
 }
 
@@ -80,7 +86,7 @@ export class LocalWhisperSTTProvider implements STTProvider {
     return true;
   }
 
-  async transcribe(audioBlob: Blob): Promise<string> {
+  async transcribe(audioBlob: Blob): Promise<STTResult> {
     const audioFile = new File([audioBlob], 'recording.webm', {
       type: audioBlob.type || 'audio/webm',
     });
@@ -106,11 +112,16 @@ export class LocalWhisperSTTProvider implements STTProvider {
       throw new Error(`Local Whisper error (${response.status}): ${errText}`);
     }
 
-    const data = (await response.json()) as { text?: string };
-    if (typeof data.text !== 'string') {
-      throw new Error('Local Whisper returned an unexpected JSON payload.');
-    }
-    return data.text;
+    const data = (await response.json()) as {
+      text?: string;
+      timestampedText?: string;
+      duration?: number;
+    };
+    return {
+      text: data.text ?? '',
+      timestampedText: data.timestampedText,
+      durationSec: data.duration,
+    };
   }
 }
 
@@ -128,7 +139,7 @@ export class WhisperSTTProvider implements STTProvider {
     return this.apiKey.length > 0;
   }
 
-  async transcribe(audioBlob: Blob, language: string = 'en'): Promise<string> {
+  async transcribe(audioBlob: Blob, language: string = 'en'): Promise<STTResult> {
     if (audioBlob.size > MAX_BLOB_SIZE_BYTES) {
       throw new Error('Audio exceeds 24 MB limit.');
     }
@@ -149,7 +160,7 @@ export class WhisperSTTProvider implements STTProvider {
       throw new Error(`OpenAI Whisper error (${response.status})`);
     }
     const data = (await response.json()) as { text?: string };
-    return data.text ?? '';
+    return { text: data.text ?? '' };
   }
 }
 
@@ -165,7 +176,7 @@ export class WebSpeechSTTProvider implements STTProvider {
     );
   }
 
-  async transcribe(_audioBlob: Blob): Promise<string> {
+  async transcribe(_audioBlob: Blob): Promise<STTResult> {
     throw new Error(
       'Web Speech API only works in live-streaming mode. Use Local Whisper (port 8000) to transcribe recorded audio blobs.'
     );

@@ -93,8 +93,10 @@ export function SessionRunner() {
         variables: {
           prompt: resp?.promptSnapshot || currentBlock.instructions,
           response: studentText,
-          transcript: studentText,
-          durationSec: String(resp?.timeSpentSec ?? 60),
+          // Prioritize timestamped text, fall back to flat text
+          transcript: resp?.timestampedTranscript || studentText, 
+          // Prioritize actual audio duration, fall back to block elapsed time
+          durationSec: String(resp?.audioDurationSec ?? resp?.timeSpentSec ?? currentBlock.durationSec), 
         },
       });
 

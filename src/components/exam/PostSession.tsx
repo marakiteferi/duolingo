@@ -69,8 +69,8 @@ export function PostSession() {
           variables: {
             prompt: response?.promptSnapshot || block.instructions,
             response: text,
-            transcript: text,
-            durationSec: String(response?.timeSpentSec ?? block.durationSec),
+            transcript: response?.timestampedTranscript || text,
+            durationSec: String(response?.audioDurationSec ?? response?.timeSpentSec ?? block.durationSec),
           },
         });
 

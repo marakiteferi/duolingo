@@ -73,8 +73,8 @@ export function HistoryPanel() {
             variables: {
               prompt: response?.promptSnapshot || block.instructions,
               response: text || '[Spoken response without text]',
-              transcript: text || '[Verbatim audio recorded]',
-              durationSec: String(response?.timeSpentSec ?? block.durationSec),
+              transcript: response?.timestampedTranscript || text || '[Verbatim audio recorded]',
+              durationSec: String(response?.audioDurationSec ?? response?.timeSpentSec ?? block.durationSec),
             },
           });
 

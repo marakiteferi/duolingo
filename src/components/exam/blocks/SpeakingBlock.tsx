@@ -106,17 +106,21 @@ export function SpeakingBlock({ block }: { block: BlockConfig }) {
           localWhisperUrl: settings?.localWhisperUrl || settings?.localSttEndpoint,
         });
 
-        const verbatimText = await stt.transcribe(blob, 'en');
+        // Receive the object instead of a string
+        const result = await stt.transcribe(blob, 'en');
+        const actualDuration = result.durationSec || durationSec;
 
         clearInterval(progressInterval);
         setTranscribeProgress(95);
         setTranscribeStage('Calculating speech rate (WPM) & fluency metrics...');
 
-        const stats = analyzeSpeechTranscript(verbatimText, Math.max(5, durationSec));
+        const stats = analyzeSpeechTranscript(result.text, Math.max(5, actualDuration));
 
         updateResponse(block.id, {
           audioBlobRef: dataUrl,
-          textOrTranscript: verbatimText || '[No speech detected in recording]',
+          textOrTranscript: result.text || '[No speech detected in recording]',
+          timestampedTranscript: result.timestampedText,
+          audioDurationSec: actualDuration,
           promptSnapshot: activePromptText,
           fillerCount: stats.fillerCount,
           wpm: stats.wpm,

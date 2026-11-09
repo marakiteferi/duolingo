@@ -109,6 +109,8 @@ export interface BlockResponse {
   questionId?: string;
   promptSnapshot?: string;
   textOrTranscript?: string;
+  timestampedTranscript?: string;
+  audioDurationSec?: number;
   audioBlobRef?: string;
   isComplete: boolean;
   timeSpentSec: number;

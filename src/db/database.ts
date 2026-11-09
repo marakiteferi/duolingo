@@ -27,24 +27,21 @@ Return ONLY a valid JSON object matching this exact schema:
   "suggestedFix": "<A 145-155 band rewrite of the student's weakest sentences>"
 }`;
 
-const DEFAULT_SPEAKING_PROMPT = `You are an expert Duolingo English Test (DET) speaking evaluator. Grade the provided verbatim speech transcript against the official DET rubric, strictly calibrating for a target score band of 140-150 (graduate-level proficiency).
-IMPORTANT: The transcript is verbatim and includes filler words ("uh", "um", "like"), stutters, and pauses. Penalize hesitation, filler density, and lack of acoustic fluency based on the speaking duration ({{durationSec}}s).
+const DEFAULT_SPEAKING_PROMPT = `You are an expert Duolingo English Test (DET) speaking evaluator. Grade the verbatim timestamped transcript against the official DET rubric for a target score band of 140-150.
 
-Speaking Task / Prompt:
-{{prompt}}
+IMPORTANT: The transcript includes precise timestamps [start - end] for every spoken phrase. Use these timestamps to evaluate the student's true speaking pace, long pauses, and hesitation density. The total actual audio recording duration was exactly {{durationSec}} seconds. Do not estimate the time; rely strictly on the {{durationSec}} variable provided.
 
-Verbatim Student Transcript:
+Speaking Task / Prompt: {{prompt}}
+Verbatim Timestamped Transcript:
 {{transcript}}
 
 Return ONLY a valid JSON object matching this exact schema:
 {
   "overallScore": <number 0-160>,
   "subscores": { "literacy": <0-160>, "comprehension": <0-160>, "conversation": <0-160>, "production": <0-160> },
-  "criteria": { "fluency": "<assessment of pace & fillers>", "lexical_diversity": "<assessment>", "grammar": "<assessment>" },
-  "strengths": ["<strength 1>", "<strength 2>"],
-  "weaknesses": ["<weakness 1>", "<weakness 2>"],
-  "suggestions": ["<specific fluency/lexical tip 1>", "<tip 2>"],
-  "suggestedFix": "<A polished, natural 150-score spoken version of the student's response>"
+  "strengths": ["<one short phrase>"],
+  "weaknesses": ["<one short phrase>"],
+  "suggestions": ["<one short fluency tip>"]
 }`;
 
 export class DETDatabase extends Dexie {
@@ -248,6 +245,11 @@ export async function ensureDatabaseUpgraded(): Promise<void> {
       await db.evalPrompts.put({
         ...ep,
         promptText: ep.appliesToType === 'speaking' ? DEFAULT_SPEAKING_PROMPT : DEFAULT_WRITING_PROMPT,
+      });
+    } else if (ep.appliesToType === 'speaking' && !ep.promptText.includes('Timestamped Transcript')) {
+      await db.evalPrompts.put({
+        ...ep,
+        promptText: DEFAULT_SPEAKING_PROMPT,
       });
     }
   }
