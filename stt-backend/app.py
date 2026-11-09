@@ -1,8 +1,12 @@
+import os
+
+# Add this exact line before importing any other libraries
+os.add_dll_directory(r"C:\Users\Golden Leaf\OneDrive\Documents\projects\Duolingo practice app\stt-backend\whisper-env\Lib\site-packages\torch\lib")
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 import shutil
-import os
 
 app = FastAPI()
 
