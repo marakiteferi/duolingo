@@ -17,6 +17,7 @@ import { PostSession } from '../components/exam/PostSession'
 export function ExamPage() {
   const setView = useAppStore((s) => s.setView)
   const activeRun = useSessionStore((s) => s.activeRun)
+  const clearActiveRun = useSessionStore((s) => s.clearActiveRun)
   const loadTemplates = useConfigStore((s) => s.loadTemplates)
 
   // Load templates for the template picker
@@ -32,33 +33,52 @@ export function ExamPage() {
       : 'in-session'
 
   const handleBackToConfig = useCallback(() => {
+    if (activeRun?.status === 'completed' || activeRun?.status === 'abandoned') {
+      clearActiveRun()
+    }
     setView('config')
-  }, [setView])
+  }, [activeRun, clearActiveRun, setView])
 
   return (
     <div className="min-h-screen bg-slate-50">
-      {/* Top bar — only shown in pre/post, hidden during session for max focus */}
+      {/* Top bar — shown in pre/post for easy navigation */}
       {phase !== 'in-session' && (
-        <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
+        <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between shadow-2xs">
           <div className="flex items-center gap-3">
             <button
               onClick={handleBackToConfig}
-              className="text-slate-500 hover:text-slate-700 transition-colors"
-              title="Back to Config"
+              className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer"
+              title="Back to Config Dashboard"
             >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
               </svg>
+              ← Back to Dashboard
             </button>
-            <h1 className="text-lg font-bold text-slate-900">DET Prep</h1>
-            <span className="text-xs text-slate-500 bg-slate-100 px-2 py-0.5 rounded">Exam</span>
+            <span className="w-px h-4 bg-slate-200" />
+            <h1 className="text-base font-bold text-slate-900">DET Practice Runner</h1>
+            <span className="text-xs text-primary-700 bg-primary-50 border border-primary-200 px-2 py-0.5 rounded font-semibold uppercase tracking-wider">
+              {phase === 'pre' ? 'Setup' : 'Review'}
+            </span>
           </div>
-          <button
-            onClick={handleBackToConfig}
-            className="text-sm text-slate-600 hover:text-slate-900 transition-colors"
-          >
-            ← Back to Config
-          </button>
+
+          <div className="flex items-center gap-2">
+            {phase === 'post' && (
+              <button
+                type="button"
+                onClick={() => clearActiveRun()}
+                className="text-xs font-semibold text-primary-700 bg-primary-50 hover:bg-primary-100 border border-primary-200 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+              >
+                + New Practice Session
+              </button>
+            )}
+            <button
+              onClick={handleBackToConfig}
+              className="text-xs font-semibold text-slate-600 hover:text-slate-900 transition-colors"
+            >
+              Settings & History →
+            </button>
+          </div>
         </header>
       )}
 

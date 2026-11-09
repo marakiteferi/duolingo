@@ -115,6 +115,17 @@ export function EvalPromptEditor() {
       {/* Prompt editor */}
       {editing && (
         <div className="bg-white rounded-lg border border-slate-200 p-6">
+          <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-100">
+            <button
+              type="button"
+              onClick={() => setEditing(null)}
+              className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+            >
+              ← Back to Prompts List
+            </button>
+            <span className="text-xs text-slate-400">Gemini Rubric Editor</span>
+          </div>
+
           <div className="grid grid-cols-3 gap-4 mb-4">
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Name</label>

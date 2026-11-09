@@ -152,7 +152,34 @@ export function PostSession() {
       : null;
 
   return (
-    <div className="max-w-3xl mx-auto px-6 py-10">
+    <div className="max-w-3xl mx-auto px-6 py-8">
+      {/* Top Navigation Bar */}
+      <div className="flex items-center justify-between mb-6 pb-3 border-b border-slate-200">
+        <button
+          type="button"
+          onClick={() => {
+            clearActiveRun();
+            setView('config');
+          }}
+          className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-100 px-3 py-1.5 rounded-lg transition-colors cursor-pointer shadow-2xs"
+        >
+          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+          </svg>
+          ← Back to Dashboard
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            clearActiveRun();
+          }}
+          className="flex items-center gap-1 text-xs font-semibold text-primary-700 bg-primary-50 border border-primary-200 hover:bg-primary-100 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+        >
+          + Choose New Practice Exam
+        </button>
+      </div>
+
       {/* Header Banner */}
       <div className="bg-white border border-slate-200 rounded-2xl p-6 mb-8 flex flex-wrap items-center justify-between gap-4 shadow-xs">
         <div>

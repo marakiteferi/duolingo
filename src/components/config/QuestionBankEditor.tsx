@@ -160,6 +160,17 @@ export function QuestionBankEditor() {
       {/* Question Editor */}
       {editingQuestion && (
         <div className="bg-white rounded-lg border border-slate-200 p-6">
+          <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-100">
+            <button
+              type="button"
+              onClick={() => setEditingQuestion(null)}
+              className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+            >
+              ← Back to Questions List
+            </button>
+            <span className="text-xs text-slate-400">Question Item Setup</span>
+          </div>
+
           <h3 className="font-semibold text-slate-900 mb-4">
             {questions.find((q) => q.id === editingQuestion.id) ? 'Edit' : 'New'} Question
           </h3>

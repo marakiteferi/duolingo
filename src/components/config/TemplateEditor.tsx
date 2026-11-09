@@ -167,6 +167,17 @@ export function TemplateEditor() {
       {/* Template Editor */}
       {editingTemplate && (
         <div className="bg-white rounded-lg border border-slate-200 p-6">
+          <div className="flex items-center justify-between mb-5 pb-3 border-b border-slate-100">
+            <button
+              type="button"
+              onClick={handleCancel}
+              className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+            >
+              ← Back to Templates List
+            </button>
+            <span className="text-xs text-slate-400">Editing Template Configuration</span>
+          </div>
+
           {/* Template name */}
           <div className="mb-6">
             <label className="block text-sm font-medium text-slate-700 mb-1">Template Name</label>

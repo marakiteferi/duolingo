@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { useConfigStore } from '../stores/configStore'
+import { useSessionStore } from '../stores/sessionStore'
 import { TemplateEditor } from '../components/config/TemplateEditor'
 import { QuestionBankEditor } from '../components/config/QuestionBankEditor'
 import { EvalPromptEditor } from '../components/config/EvalPromptEditor'
@@ -17,6 +18,8 @@ export function ConfigPage() {
   const configSection = useAppStore((s) => s.configSection)
   const setConfigSection = useAppStore((s) => s.setConfigSection)
   const setView = useAppStore((s) => s.setView)
+  const activeRun = useSessionStore((s) => s.activeRun)
+  const clearActiveRun = useSessionStore((s) => s.clearActiveRun)
   const loadTemplates = useConfigStore((s) => s.loadTemplates)
   const loadQuestions = useConfigStore((s) => s.loadQuestions)
   const loadEvalPrompts = useConfigStore((s) => s.loadEvalPrompts)
@@ -27,6 +30,13 @@ export function ConfigPage() {
     loadQuestions()
     loadEvalPrompts()
   }, [loadTemplates, loadQuestions, loadEvalPrompts])
+
+  const handleStartExam = () => {
+    if (activeRun?.status === 'completed' || activeRun?.status === 'abandoned') {
+      clearActiveRun()
+    }
+    setView('exam')
+  }
 
   const navItems = [
     { key: 'templates' as const, label: 'Session Templates', icon: '📋' },
@@ -67,11 +77,11 @@ export function ConfigPage() {
         {/* Switch to Exam button */}
         <div className="p-3 border-t border-slate-200">
           <button
-            onClick={() => setView('exam')}
-            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-primary-600 text-white rounded-lg text-sm font-semibold hover:bg-primary-700 transition-colors"
+            onClick={handleStartExam}
+            className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-primary-600 text-white rounded-lg text-sm font-semibold hover:bg-primary-700 transition-colors cursor-pointer shadow-xs"
           >
             <span>🎯</span>
-            Start Exam Session
+            {activeRun?.status === 'in-progress' ? 'Resume Running Exam' : 'Start Exam Session'}
           </button>
         </div>
       </aside>

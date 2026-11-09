@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useAppStore } from '../../stores/appStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useConfigStore } from '../../stores/configStore';
 import { db, ensureDatabaseUpgraded } from '../../db/database';
@@ -7,6 +8,7 @@ import type { SessionRun, DETQuestionType } from '../../types';
 import { formatTime } from '../../utils/helpers';
 
 export function PreSession() {
+  const setView = useAppStore((s) => s.setView);
   const templates = useConfigStore((s) => s.templates);
   const loadTemplates = useConfigStore((s) => s.loadTemplates);
   const startSession = useSessionStore((s) => s.startSession);
@@ -19,7 +21,7 @@ export function PreSession() {
   const [whisperOnline, setWhisperOnline] = useState<boolean | null>(null);
   const [starting, setStarting] = useState(false);
 
-  // User customization states
+  // User customization states — always configurable for each exam attempt
   const [selectedBlockIds, setSelectedBlockIds] = useState<string[]>([]);
   const [customDurations, setCustomDurations] = useState<Record<string, number>>({});
   const [instantFeedback, setInstantFeedback] = useState<boolean>(true);
@@ -103,7 +105,24 @@ export function PreSession() {
   };
 
   return (
-    <div className="max-w-3xl mx-auto px-6 py-10">
+    <div className="max-w-3xl mx-auto px-6 py-8">
+      {/* Top Back Navigation Bar */}
+      <div className="flex items-center justify-between mb-6 pb-4 border-b border-slate-200">
+        <button
+          type="button"
+          onClick={() => setView('config')}
+          className="flex items-center gap-2 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 px-3.5 py-2 rounded-lg shadow-2xs transition-colors cursor-pointer"
+        >
+          <svg className="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+          </svg>
+          ← Back to Dashboard
+        </button>
+        <span className="text-xs text-slate-400 font-medium">
+          Step 1: Choose Your Practice Mode
+        </span>
+      </div>
+
       {/* Interrupted Session Banner */}
       {incompleteRun && (
         <div className="mb-8 bg-amber-50 border border-amber-200 rounded-xl p-5 flex flex-wrap items-center justify-between gap-4">
@@ -272,32 +291,47 @@ export function PreSession() {
           <label className="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">
             3. AI Feedback Timing
           </label>
-          <div className="space-y-2">
-            <label className="flex items-start gap-2.5 cursor-pointer">
+          <div className="space-y-2.5">
+            <label
+              className={`flex items-start gap-3 p-3 rounded-xl border-2 cursor-pointer transition-all ${
+                instantFeedback
+                  ? 'border-primary-500 bg-primary-50/70 shadow-2xs'
+                  : 'border-slate-200 bg-white hover:border-slate-300'
+              }`}
+            >
               <input
                 type="radio"
+                name="feedbackMode"
                 checked={instantFeedback}
                 onChange={() => setInstantFeedback(true)}
-                className="mt-1 text-primary-600"
+                className="mt-1 text-primary-600 focus:ring-primary-500"
               />
               <div>
-                <p className="text-sm font-semibold text-slate-800">⚡ Instant Per-Block Feedback</p>
-                <p className="text-xs text-slate-500">
-                  Grade any block immediately while practicing (pauses timer while reviewing).
+                <p className="text-sm font-bold text-slate-900">⚡ Instant Per-Block Feedback</p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Request AI score & 145+ fix after each block (timer automatically pauses during review).
                 </p>
               </div>
             </label>
-            <label className="flex items-start gap-2.5 cursor-pointer">
+
+            <label
+              className={`flex items-start gap-3 p-3 rounded-xl border-2 cursor-pointer transition-all ${
+                !instantFeedback
+                  ? 'border-primary-500 bg-primary-50/70 shadow-2xs'
+                  : 'border-slate-200 bg-white hover:border-slate-300'
+              }`}
+            >
               <input
                 type="radio"
+                name="feedbackMode"
                 checked={!instantFeedback}
                 onChange={() => setInstantFeedback(false)}
-                className="mt-1 text-primary-600"
+                className="mt-1 text-primary-600 focus:ring-primary-500"
               />
               <div>
-                <p className="text-sm font-semibold text-slate-800">🎯 Exam Simulation Mode</p>
-                <p className="text-xs text-slate-500">
-                  No interruptions—evaluate all blocks together at the end of the session.
+                <p className="text-sm font-bold text-slate-900">🎯 Full Exam Simulation Mode</p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Realistic test pacing without interruptions. Review all composite scores at the end.
                 </p>
               </div>
             </label>

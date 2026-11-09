@@ -152,6 +152,17 @@ export function SessionRunner() {
 
         <div className="flex items-center justify-between px-6 py-2.5">
           <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={handleAbandon}
+              className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 border border-slate-200 px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer mr-1"
+              title="Exit this session and return to Dashboard"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+              </svg>
+              Exit to Dashboard
+            </button>
             <span className="text-xs font-bold text-primary-700 bg-primary-50 px-2.5 py-1 rounded-md">
               Block {currentBlockIndex + 1} / {totalBlocks}
             </span>

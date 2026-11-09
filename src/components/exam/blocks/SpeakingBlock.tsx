@@ -28,6 +28,8 @@ export function SpeakingBlock({ block }: { block: BlockConfig }) {
   const [whisperOnline, setWhisperOnline] = useState<boolean | null>(null);
   const [prompts, setPrompts] = useState<QuestionBankItem[]>([]);
   const [selectedPromptIdx, setSelectedPromptIdx] = useState(0);
+  const [transcribeProgress, setTranscribeProgress] = useState(0);
+  const [transcribeStage, setTranscribeStage] = useState('');
 
   const recorderRef = useRef<AudioRecorderService | null>(null);
   const animFrameRef = useRef<number>(0);
@@ -75,16 +77,42 @@ export function SpeakingBlock({ block }: { block: BlockConfig }) {
   const transcribeBlob = useCallback(
     async (blob: Blob, durationSec: number) => {
       setRecordingState('transcribing');
+      setTranscribeProgress(15);
+      setTranscribeStage('Packaging audio recording...');
       setError(null);
+
+      const progressInterval = setInterval(() => {
+        setTranscribeProgress((prev) => {
+          if (prev < 35) {
+            setTranscribeStage('Connecting to Faster-Whisper neural STT server...');
+            return prev + 5;
+          }
+          if (prev < 65) {
+            setTranscribeStage('Running beam search & verbatim speech recognition...');
+            return prev + 6;
+          }
+          if (prev < 88) {
+            setTranscribeStage('Detecting pauses, fillers & hesitation markers ("uh", "um")...');
+            return prev + 3;
+          }
+          return prev;
+        });
+      }, 200);
+
       try {
         const dataUrl = await blobToDataUrl(blob);
         const settings = await db.settings.get('app-settings');
         const stt = createSTTProvider(settings?.sttProvider ?? 'local-whisper', {
           apiKey: settings?.sttApiKey,
-          localWhisperUrl: settings?.localWhisperUrl,
+          localWhisperUrl: settings?.localWhisperUrl || settings?.localSttEndpoint,
         });
 
         const verbatimText = await stt.transcribe(blob, 'en');
+
+        clearInterval(progressInterval);
+        setTranscribeProgress(95);
+        setTranscribeStage('Calculating speech rate (WPM) & fluency metrics...');
+
         const stats = analyzeSpeechTranscript(verbatimText, Math.max(5, durationSec));
 
         updateResponse(block.id, {
@@ -94,8 +122,14 @@ export function SpeakingBlock({ block }: { block: BlockConfig }) {
           fillerCount: stats.fillerCount,
           wpm: stats.wpm,
         });
-        setRecordingState('done');
+
+        setTranscribeProgress(100);
+        setTranscribeStage('Transcription complete!');
+        setTimeout(() => {
+          setRecordingState('done');
+        }, 350);
       } catch (err) {
+        clearInterval(progressInterval);
         const msg = err instanceof Error ? err.message : 'Transcription failed';
         setError(msg);
         const fallbackUrl = await blobToDataUrl(blob).catch(() => '');
@@ -268,16 +302,31 @@ export function SpeakingBlock({ block }: { block: BlockConfig }) {
         </div>
       )}
 
-      {/* Transcribing Spinner */}
+      {/* Transcribing Progress Bar */}
       {recordingState === 'transcribing' && (
-        <div className="bg-accent-50 border border-accent-200 rounded-xl p-6 text-center space-y-2">
-          <div className="inline-block w-6 h-6 border-2 border-accent-600 border-t-transparent rounded-full animate-spin" />
-          <p className="text-sm font-semibold text-accent-800">
-            Transcribing via Local Faster-Whisper (RTX 3050)...
-          </p>
-          <p className="text-xs text-accent-600">
-            Preserving verbatim hesitations ("uh", "um", pauses) for accurate DET fluency grading.
-          </p>
+        <div className="bg-accent-50 border border-accent-200 rounded-xl p-6 space-y-4 shadow-xs">
+          <div className="flex items-center justify-between text-xs font-semibold text-accent-800">
+            <span className="flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded-full bg-accent-600 animate-pulse" />
+              {transcribeStage || 'Transcribing Speech...'}
+            </span>
+            <span className="font-mono text-sm font-bold text-accent-700">
+              {transcribeProgress}%
+            </span>
+          </div>
+
+          {/* Animated Progress Bar */}
+          <div className="w-full bg-accent-200/80 h-3 rounded-full overflow-hidden p-0.5 shadow-inner">
+            <div
+              className="bg-accent-600 h-full rounded-full transition-all duration-200 ease-out shadow-xs"
+              style={{ width: `${Math.min(100, Math.max(5, transcribeProgress))}%` }}
+            />
+          </div>
+
+          <div className="flex items-center justify-between text-[11px] text-accent-600">
+            <span>Preserving verbatim hesitations ("uh", "um", pauses) for DET 140–150 calibration</span>
+            <span>{Math.round(recordingSeconds)}s audio</span>
+          </div>
         </div>
       )}
 
