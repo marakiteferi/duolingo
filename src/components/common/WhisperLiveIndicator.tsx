@@ -221,3 +221,4 @@ export function WhisperLiveIndicator({ compact = false, className = '' }: Whispe
   );
 }
 export default WhisperLiveIndicator;
+
