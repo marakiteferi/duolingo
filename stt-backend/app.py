@@ -35,7 +35,25 @@ async def transcribe_audio(file: UploadFile = File(...)):
             initial_prompt="Uh, um, like, so yeah, well, [cough], [silent]..."
         )
         
-        text_output = " ".join([segment.text for segment in segments])
+        print(f"\n🎙️  Processing {info.duration:.1f} seconds of audio...")
+        text_output = ""
+        
+        # Loop through the transcription as it happens to create a visual cue
+        for segment in segments:
+            progress = min(100.0, (segment.end / info.duration) * 100)
+            
+            # Create a visual progress bar block
+            bar_length = 20
+            filled = int((progress / 100) * bar_length)
+            bar = "█" * filled + "-" * (bar_length - filled)
+            
+            # Print the progress bar alongside the text it just figured out
+            print(f"[{bar}] {progress:5.1f}% |{segment.text}")
+            
+            text_output += segment.text + " "
+            
+        print("✅ Transcription Complete!\n")
+        
         return {"text": text_output.strip(), "duration": info.duration}
     finally:
         if os.path.exists(temp_file):

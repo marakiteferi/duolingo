@@ -38,7 +38,14 @@ export function EvalPromptEditor() {
     setEditing(null)
   }
 
-  const templateVars = ['{{prompt}}', '{{response}}', '{{transcript}}', '{{durationSec}}']
+  const templateVars = [
+    '{{prompt}}',
+    '{{response}}',
+    '{{transcript}}',
+    '{{durationSec}}',
+    '{{fillerCount}}',
+    '{{wpm}}',
+  ]
 
   return (
     <div>
