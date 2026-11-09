@@ -9,7 +9,6 @@ export interface EvaluateParams {
   variables: Record<string, string>;
 }
 
-const GEMINI_MODEL = 'gemini-2.0-flash';
 const RETRY_DELAY_MS = 2_000;
 const REQUEST_TIMEOUT_MS = 35_000;
 
@@ -92,27 +91,43 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// 1. Update evaluateResponse to support an array of models
 export async function evaluateResponse(params: EvaluateParams): Promise<AIFeedback> {
   const { apiKey, evalPromptTemplate, variables } = params;
-
   if (!apiKey) {
     throw new Error('Gemini API key is missing. Add your free Google AI Studio key in Config -> Settings.');
   }
 
   const prompt = interpolateTemplate(evalPromptTemplate, variables);
   let lastError: Error | null = null;
+  const maxRetriesPerModel = 2; 
+  
+  // Define fallback models: primary first, then fallback
+  const modelsToTry = ['gemini-3.8-flash', 'gemini-3.6-flash'];
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      return await callGemini(apiKey, prompt);
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-      if (isNonRetryableError(lastError)) throw lastError;
-      if (attempt === 0) await delay(RETRY_DELAY_MS);
+  for (const currentModel of modelsToTry) {
+    for (let attempt = 0; attempt <= maxRetriesPerModel; attempt++) {
+      try {
+        // Pass the current model string down to callGemini
+        return await callGemini(apiKey, prompt, currentModel); 
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        
+        // Stop immediately if it's an auth/permissions error
+        if (isNonRetryableError(lastError)) throw lastError;
+
+        if (attempt < maxRetriesPerModel) {
+          // Exponential backoff
+          const backoffMs = RETRY_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000;
+          console.warn(`Gemini API busy (${currentModel}). Retrying in ${Math.round(backoffMs/1000)}s...`);
+          await delay(backoffMs);
+        }
+      }
     }
+    console.warn(`Exhausted retries for ${currentModel}. Falling back to next model...`);
   }
-
-  throw new Error(`Gemini evaluation failed: ${lastError?.message ?? 'Unknown error'}`);
+  
+  throw new Error(`Gemini evaluation failed after trying all fallback models: ${lastError?.message ?? 'Unknown error'}`);
 }
 
 function isNonRetryableError(error: Error): boolean {
@@ -120,10 +135,13 @@ function isNonRetryableError(error: Error): boolean {
   return msg.includes('api key') || msg.includes('invalid') || msg.includes('permission') || msg.includes('forbidden');
 }
 
-async function callGemini(apiKey: string, prompt: string): Promise<AIFeedback> {
+// 2. Add the 'modelName' parameter to callGemini
+async function callGemini(apiKey: string, prompt: string, modelName: string): Promise<AIFeedback> {
   const genAI = new GoogleGenerativeAI(apiKey);
+  
+  // Initialize the specific model passed from the loop above
   const model = genAI.getGenerativeModel({
-    model: GEMINI_MODEL,
+    model: modelName, 
     generationConfig: {
       responseMimeType: 'application/json',
     },
