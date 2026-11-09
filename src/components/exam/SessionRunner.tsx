@@ -12,6 +12,7 @@ import { db } from '../../db/database';
 import { evaluateResponse } from '../../services/gemini';
 import { BlockInputRouter } from './BlockInputRouter';
 import { TransitionOverlay } from './TransitionOverlay';
+import { WhisperLiveIndicator } from '../common/WhisperLiveIndicator';
 
 export function SessionRunner() {
   const isRunning = useSessionStore((s) => s.isRunning);
@@ -174,7 +175,8 @@ export function SessionRunner() {
             )}
           </div>
 
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
+            <WhisperLiveIndicator compact />
             <span className="text-xs text-slate-400 font-mono">
               Total {formatTime(overallElapsedSec)}
             </span>

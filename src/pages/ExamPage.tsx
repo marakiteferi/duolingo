@@ -5,6 +5,7 @@ import { useConfigStore } from '../stores/configStore'
 import { PreSession } from '../components/exam/PreSession'
 import { SessionRunner } from '../components/exam/SessionRunner'
 import { PostSession } from '../components/exam/PostSession'
+import { WhisperLiveIndicator } from '../components/common/WhisperLiveIndicator'
 
 /**
  * Exam Page — The timed exam runner.
@@ -62,7 +63,8 @@ export function ExamPage() {
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
+            <WhisperLiveIndicator compact />
             {phase === 'post' && (
               <button
                 type="button"

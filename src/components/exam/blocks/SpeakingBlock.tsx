@@ -5,6 +5,7 @@ import { createSTTProvider, analyzeSpeechTranscript, checkLocalWhisperHealth } f
 import { db } from '../../../db/database';
 import { getAdaptiveQuestions } from '../../../utils/adaptive';
 import type { BlockConfig, QuestionBankItem } from '../../../types';
+import { WhisperLiveIndicator } from '../../common/WhisperLiveIndicator';
 
 function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -235,28 +236,7 @@ export function SpeakingBlock({ block }: { block: BlockConfig }) {
     <div className="space-y-5">
       {/* Local GPU Status & Prompt Header */}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <span
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
-              whisperOnline
-                ? 'bg-green-100 text-green-800'
-                : whisperOnline === false
-                ? 'bg-red-100 text-red-700'
-                : 'bg-slate-100 text-slate-600'
-            }`}
-          >
-            <span
-              className={`w-2 h-2 rounded-full ${
-                whisperOnline ? 'bg-green-500' : whisperOnline === false ? 'bg-red-500' : 'bg-slate-400'
-              }`}
-            />
-            {whisperOnline
-              ? 'Local Whisper GPU Online (Verbatim Mode)'
-              : whisperOnline === false
-              ? 'Local Whisper Offline (Start python app.py on port 8000)'
-              : 'Checking Local Whisper...'}
-          </span>
-        </div>
+        <WhisperLiveIndicator />
 
         {prompts.length > 1 && (
           <button

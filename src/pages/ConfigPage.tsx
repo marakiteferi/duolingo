@@ -7,6 +7,7 @@ import { QuestionBankEditor } from '../components/config/QuestionBankEditor'
 import { EvalPromptEditor } from '../components/config/EvalPromptEditor'
 import { HistoryPanel } from '../components/config/HistoryPanel'
 import { SettingsPanel } from '../components/config/SettingsPanel'
+import { WhisperLiveIndicator } from '../components/common/WhisperLiveIndicator'
 
 /**
  * Config Page — Admin panel for managing session templates,
@@ -73,6 +74,14 @@ export function ConfigPage() {
             </button>
           ))}
         </nav>
+
+        {/* Whisper AI Live Status Indicator */}
+        <div className="p-3 border-t border-slate-200">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1 px-1">
+            Whisper Speech AI
+          </div>
+          <WhisperLiveIndicator compact className="w-full" />
+        </div>
 
         {/* Switch to Exam button */}
         <div className="p-3 border-t border-slate-200">

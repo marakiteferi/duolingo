@@ -1,0 +1,7 @@
+{
+  "venvPath": "stt-backend",
+  "venv": "whisper-env",
+  "extraPaths": [
+    "stt-backend/whisper-env/Lib/site-packages"
+  ]
+}

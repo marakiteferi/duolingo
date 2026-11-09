@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { db } from '../../db/database'
 import type { Settings, STTProvider as STTProviderType } from '../../types'
+import { WhisperLiveIndicator } from '../common/WhisperLiveIndicator'
 
 /**
  * SettingsPanel — Manages API keys, STT provider selection,
@@ -156,10 +157,13 @@ export function SettingsPanel() {
             </div>
 
             {settings.sttProvider === 'local-whisper' && (
-              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-2">
-                <label className="block text-xs font-semibold text-slate-700">
-                  Local Whisper API Endpoint
-                </label>
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Local Whisper API Endpoint
+                  </label>
+                  <WhisperLiveIndicator />
+                </div>
                 <div className="flex gap-2">
                   <input
                     type="text"

@@ -6,6 +6,7 @@ import { db, ensureDatabaseUpgraded } from '../../db/database';
 import { checkLocalWhisperHealth } from '../../services/stt';
 import type { SessionRun, DETQuestionType } from '../../types';
 import { formatTime } from '../../utils/helpers';
+import { WhisperLiveIndicator } from '../common/WhisperLiveIndicator';
 
 export function PreSession() {
   const setView = useAppStore((s) => s.setView);
@@ -157,15 +158,7 @@ export function PreSession() {
             Choose a full template or select individual blocks, question types, and feedback mode.
           </p>
         </div>
-        <span
-          className={`text-xs font-medium px-3 py-1 rounded-full ${
-            whisperOnline
-              ? 'bg-green-100 text-green-800'
-              : 'bg-slate-200 text-slate-700'
-          }`}
-        >
-          {whisperOnline ? '🟢 Local Whisper GPU Ready' : '⚪ Local Whisper (Port 8000)'}
-        </span>
+        <WhisperLiveIndicator />
       </div>
 
       {/* 1. Template Picker */}
