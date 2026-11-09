@@ -91,7 +91,6 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// 1. Update evaluateResponse to support an array of models
 export async function evaluateResponse(params: EvaluateParams): Promise<AIFeedback> {
   const { apiKey, evalPromptTemplate, variables } = params;
   if (!apiKey) {
@@ -102,37 +101,39 @@ export async function evaluateResponse(params: EvaluateParams): Promise<AIFeedba
   let lastError: Error | null = null;
   const maxRetriesPerModel = 2; 
   
-  // Define fallback models: primary first, then fallback
+  // Try fastest/newest models first, fall back to older stables
   const modelsToTry = ['gemini-3.8-flash', 'gemini-3.6-flash'];
 
   for (const currentModel of modelsToTry) {
     for (let attempt = 0; attempt <= maxRetriesPerModel; attempt++) {
       try {
-        // Pass the current model string down to callGemini
         return await callGemini(apiKey, prompt, currentModel); 
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
+        const msg = lastError.message.toLowerCase();
         
-        // Stop immediately if it's an auth/permissions error
-        if (isNonRetryableError(lastError)) throw lastError;
+        // 1. Hard fail on auth/permission issues (kill everything)
+        if (msg.includes('api key') || msg.includes('permission') || msg.includes('forbidden')) {
+          throw lastError; 
+        }
+        
+        // 2. Immediate fallback on 404 or deprecated model (skip retries, jump to next model)
+        if (msg.includes('404') || msg.includes('not found') || msg.includes('no longer available') || msg.includes('invalid')) {
+          console.warn(`Model ${currentModel} unavailable. Falling back instantly...`);
+          break; 
+        }
 
+        // 3. Retry with backoff on 503/429 Server Busy
         if (attempt < maxRetriesPerModel) {
-          // Exponential backoff
           const backoffMs = RETRY_DELAY_MS * Math.pow(2, attempt) + Math.random() * 1000;
           console.warn(`Gemini API busy (${currentModel}). Retrying in ${Math.round(backoffMs/1000)}s...`);
           await delay(backoffMs);
         }
       }
     }
-    console.warn(`Exhausted retries for ${currentModel}. Falling back to next model...`);
   }
   
   throw new Error(`Gemini evaluation failed after trying all fallback models: ${lastError?.message ?? 'Unknown error'}`);
-}
-
-function isNonRetryableError(error: Error): boolean {
-  const msg = error.message.toLowerCase();
-  return msg.includes('api key') || msg.includes('invalid') || msg.includes('permission') || msg.includes('forbidden');
 }
 
 // 2. Add the 'modelName' parameter to callGemini
