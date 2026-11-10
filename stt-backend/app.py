@@ -39,8 +39,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve saved human audio clips at http://127.0.0.1:8000/audio/<filename>
-app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
+# Serve saved human audio clips at http://127.0.0.1:8000/clips/<filename>
+# NOTE: mounted at /clips (not /audio) to avoid intercepting POST /audio/upload and /audio/youtube
+app.mount("/clips", StaticFiles(directory=AUDIO_DIR), name="clips")
 
 print("Loading Faster-Whisper model...")
 model = WhisperModel("large-v3-turbo", device="cuda", compute_type="int8_float16")
@@ -109,7 +110,7 @@ async def upload_human_audio(
         transcript_data = run_whisper_on_file(dest_path, verbatim_prompt=False)
 
     return {
-        "audioUrl": f"http://127.0.0.1:8000/audio/{safe_name}",
+        "audioUrl": f"http://127.0.0.1:8000/clips/{safe_name}",
         "filename": safe_name,
         "text": transcript_data["text"],
         "timestampedText": transcript_data["timestampedText"],
@@ -159,7 +160,7 @@ async def import_youtube_clip(req: YoutubeClipRequest):
     filename = os.path.basename(saved_file)
 
     return {
-        "audioUrl": f"http://127.0.0.1:8000/audio/{filename}",
+        "audioUrl": f"http://127.0.0.1:8000/clips/{filename}",
         "filename": filename,
         "text": transcript_data["text"],
         "timestampedText": transcript_data["timestampedText"],
