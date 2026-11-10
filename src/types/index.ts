@@ -59,26 +59,18 @@ export interface ClozeBlankItem {
 
 export interface InteractiveReadingData {
   sourceName: string;
-  /** Paragraph 1 containing {{1}}, {{2}}, etc. for "Complete the Sentences" */
   paragraph1WithBlanks: string;
-  /** Clean Paragraph 1 split into individual sentences for "Highlight the Answer" */
   paragraph1Sentences: string[];
   blanks: ClozeBlankItem[];
-  /** Step 2: Complete the Passage (bridge sentence between P1 and P2) */
   passageGapOptions: string[];
   correctPassageGap: string;
-  /** Clean Paragraph 2 split into individual sentences for "Highlight the Answer" */
   paragraph2Sentences: string[];
-  /** Step 3: Highlight the Answer #1 */
   highlightQuestion1: string;
   correctHighlight1: string;
-  /** Step 4: Highlight the Answer #2 */
   highlightQuestion2: string;
   correctHighlight2: string;
-  /** Step 5: Identify the Idea */
   mainIdeaOptions: string[];
   correctMainIdea: string;
-  /** Step 6: Title the Passage */
   titleOptions: string[];
   correctTitle: string;
 }
@@ -93,9 +85,16 @@ export interface ReadAndCompleteBlank {
 export interface ReadAndCompleteData {
   sourceName: string;
   title: string;
-  /** Passage containing {{1}}, {{2}}, etc. for prefix completion */
   passageWithBlanks: string;
   blanks: ReadAndCompleteBlank[];
+}
+
+export interface YoutubeAudioSource {
+  clipKey: string;
+  url: string;
+  startTime: string;
+  endTime: string;
+  speaker: string;
 }
 
 export interface QuestionBankItem {
@@ -108,6 +107,7 @@ export interface QuestionBankItem {
   targetChunks?: string[];
   sourceAudioText?: string;
   audioUrl?: string;
+  youtubeSource?: YoutubeAudioSource;
   interactiveReading?: InteractiveReadingData;
   readAndComplete?: ReadAndCompleteData;
   difficulty: number | 'easy' | 'mid' | 'hard';
