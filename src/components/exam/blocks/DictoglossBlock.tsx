@@ -5,6 +5,11 @@ import type { BlockConfig, QuestionBankItem } from '../../../types';
 
 const BACKEND_BASE = 'http://127.0.0.1:8000';
 
+function normalizeAudioUrl(url?: string): string {
+  if (!url) return '';
+  return url.replace('http://127.0.0.1:8000/audio/', 'http://127.0.0.1:8000/clips/');
+}
+
 export function DictoglossBlock({ block }: { block: BlockConfig }) {
   const draftResponses = useSessionStore((s) => s.draftResponses);
   const updateResponse = useSessionStore((s) => s.updateResponse);
@@ -40,18 +45,27 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
           const cached = manifest[q.youtubeSource.clipKey];
           return {
             ...q,
-            audioUrl: cached.audioUrl,
+            audioUrl: normalizeAudioUrl(cached.audioUrl),
             sourceAudioText: cached.text || q.sourceAudioText,
           };
         }
-        return q;
+        return {
+          ...q,
+          audioUrl: q.audioUrl ? normalizeAudioUrl(q.audioUrl) : q.audioUrl,
+        };
       });
 
       const items = hydrated.filter(
         (q) => Boolean(q.audioUrl) || q.tags.includes('dictogloss') || q.skill === 'listening'
       );
       items.sort((a, b) => (b.audioUrl ? 1 : 0) - (a.audioUrl ? 1 : 0));
-      setPassages(items.length > 0 ? items : hydrated);
+      const finalList = items.length > 0 ? items : hydrated;
+      setPassages(finalList);
+
+      if (block.questionSetId) {
+        const pinnedIdx = finalList.findIndex((q) => q.id === block.questionSetId);
+        if (pinnedIdx >= 0) setSelectedIdx(pinnedIdx);
+      }
     };
     void loadDictoglossItems();
     return () => {
@@ -59,10 +73,10 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
         window.speechSynthesis.cancel();
       }
     };
-  }, []);
+  }, [block.questionSetId]);
 
   const currentItem = passages[selectedIdx];
-  const humanAudioUrl = currentItem?.audioUrl?.trim() || '';
+  const humanAudioUrl = normalizeAudioUrl(currentItem?.audioUrl?.trim());
   const sourcePassage =
     currentItem?.sourceAudioText ||
     currentItem?.prompt ||
@@ -95,6 +109,7 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
     updateResponse(block.id, {
       fragmentNotes: val,
       promptSnapshot: sourcePassage,
+      questionId: currentItem?.id,
     });
   };
 
@@ -119,16 +134,20 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
         </div>
         <div className="flex items-center gap-2">
           {passages.length > 1 && (
-            <button
-              type="button"
-              onClick={() => {
+            <select
+              value={selectedIdx}
+              onChange={(e) => {
                 setPlayCount(0);
-                setSelectedIdx((i) => (i + 1) % passages.length);
+                setSelectedIdx(Number(e.target.value));
               }}
-              className="px-2.5 py-1.5 text-xs font-semibold text-slate-600 border border-slate-200 rounded-lg cursor-pointer"
+              className="px-2.5 py-1.5 text-xs font-semibold text-slate-700 border border-slate-200 rounded-lg cursor-pointer max-w-[200px]"
             >
-              Switch Audio ({selectedIdx + 1}/{passages.length})
-            </button>
+              {passages.map((p, idx) => (
+                <option key={p.id} value={idx}>
+                  #{idx + 1} {p.sourceAttribution || p.prompt.slice(0, 32)}
+                </option>
+              ))}
+            </select>
           )}
           <button
             type="button"
@@ -238,6 +257,7 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
               updateResponse(block.id, {
                 textOrTranscript: e.target.value,
                 promptSnapshot: sourcePassage,
+                questionId: currentItem?.id,
               })
             }
             placeholder="Reconstruct the passage's full meaning using complex subordination (whereas, consequently, while) and academic collocations..."

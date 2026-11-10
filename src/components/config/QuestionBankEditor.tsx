@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useConfigStore } from '../../stores/configStore';
 import { db, ensureDatabaseUpgraded } from '../../db/database';
 import type {
@@ -11,6 +11,25 @@ import type {
 import { generateId } from '../../utils/helpers';
 
 const BACKEND_BASE = 'http://127.0.0.1:8000';
+
+interface BulkYoutubeQueueItem {
+  id: string;
+  url: string;
+  startTime: string;
+  endTime: string;
+  speaker: string;
+  targetMode: 'shadowing' | 'dictogloss';
+  existingQuestionId?: string;
+  clipKey?: string;
+  status: 'queued' | 'processing' | 'done' | 'error';
+  message?: string;
+  audioUrl?: string;
+}
+
+function normalizeAudioUrl(url?: string): string {
+  if (!url) return '';
+  return url.replace('http://127.0.0.1:8000/audio/', 'http://127.0.0.1:8000/clips/');
+}
 
 function readAndCompleteToBracketText(rc?: ReadAndCompleteData): string {
   if (!rc) return '';
@@ -75,8 +94,58 @@ function autoBracketPlainParagraph(plainText: string): string {
     .join('');
 }
 
+/**
+ * Parses pasted multi-line text or CSV content into queue items.
+ * Supported formats per line:
+ * 1) Just a URL: https://www.youtube.com/watch?v=...
+ * 2) CSV: url, startTime, endTime, speaker/title, mode(shadowing|dictogloss)
+ */
+function parseBulkInputToQueueItems(rawText: string): BulkYoutubeQueueItem[] {
+  const lines = rawText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith('#'));
+
+  const results: BulkYoutubeQueueItem[] = [];
+
+  for (const line of lines) {
+    // Skip CSV header row if present
+    if (/^url\s*,/i.test(line)) continue;
+
+    const cols = line.split(',').map((c) => c.trim().replace(/^["']|["']$/g, ''));
+    const url = cols[0] ?? '';
+    if (!url.startsWith('http')) continue;
+
+    const timeRegex = /^\d{1,2}:\d{2}(:\d{2})?$/;
+    const startTime = cols[1] && timeRegex.test(cols[1]) ? cols[1] : '00:20';
+    const endTime = cols[2] && timeRegex.test(cols[2]) ? cols[2] : '01:35';
+    const speaker =
+      cols[3] && !timeRegex.test(cols[3])
+        ? cols[3]
+        : cols[1] && !timeRegex.test(cols[1])
+        ? cols[1]
+        : `YouTube Clip (${startTime}-${endTime})`;
+    const rawMode = (cols[4] ?? '').toLowerCase();
+    const targetMode: 'shadowing' | 'dictogloss' =
+      rawMode.includes('dicto') || rawMode.includes('listen') ? 'dictogloss' : 'shadowing';
+
+    results.push({
+      id: generateId(),
+      url,
+      startTime,
+      endTime,
+      speaker,
+      targetMode,
+      status: 'queued',
+    });
+  }
+
+  return results;
+}
+
 export function QuestionBankEditor() {
   const questions = useConfigStore((s) => s.questions);
+  const loadQuestions = useConfigStore((s) => s.loadQuestions);
   const saveQuestion = useConfigStore((s) => s.saveQuestion);
   const deleteQuestion = useConfigStore((s) => s.deleteQuestion);
 
@@ -89,24 +158,36 @@ export function QuestionBankEditor() {
   const [rcSource, setRcSource] = useState('');
   const [rcBracketText, setRcBracketText] = useState('');
 
+  // Bulk YouTube & CSV Queue Studio state
+  const [showBulkStudio, setShowBulkStudio] = useState<boolean>(true);
+  const [bulkRawText, setBulkRawText] = useState<string>('');
+  const [queueItems, setQueueItems] = useState<BulkYoutubeQueueItem[]>([]);
+  const [isProcessingQueue, setIsProcessingQueue] = useState<boolean>(false);
+  const stopQueueRef = useRef<boolean>(false);
+
+  // Single question editor audio states
   const [uploadingAudio, setUploadingAudio] = useState(false);
-  const [batchDownloading, setBatchDownloading] = useState(false);
-  const [batchStatus, setBatchStatus] = useState<string | null>(null);
   const [ytUrl, setYtUrl] = useState('');
   const [ytStart, setYtStart] = useState('00:20');
   const [ytEnd, setYtEnd] = useState('01:35');
   const [audioStatus, setAudioStatus] = useState<string | null>(null);
   const [audioError, setAudioError] = useState<string | null>(null);
 
-  // Ensure DB is upgraded and store is synced when opening Question Bank
   useEffect(() => {
     void ensureDatabaseUpgraded().then(async () => {
-      const allInDb = await db.questionBank.toArray();
-      if (allInDb.length > questions.length && allInDb[0]) {
-        await saveQuestion(allInDb[0]);
+      // Also normalize any legacy /audio/ URLs stored in IndexedDB to /clips/
+      const all = await db.questionBank.toArray();
+      for (const q of all) {
+        if (q.audioUrl && q.audioUrl.includes('/audio/')) {
+          await db.questionBank.put({
+            ...q,
+            audioUrl: normalizeAudioUrl(q.audioUrl),
+          });
+        }
       }
+      await loadQuestions();
     });
-  }, [questions.length, saveQuestion]);
+  }, [loadQuestions]);
 
   const skills: { value: DETSkill; label: string }[] = [
     { value: 'reading', label: '📖 Reading (Read & Complete / Interactive)' },
@@ -129,12 +210,200 @@ export function QuestionBankEditor() {
   const filtered =
     filterSkill === 'all' ? questions : questions.filter((q) => q.skill === filterSkill);
 
+  // =========================================================================
+  // BULK YOUTUBE & CSV QUEUE HANDLERS
+  // =========================================================================
+  const handleParseTextToQueue = () => {
+    const parsed = parseBulkInputToQueueItems(bulkRawText);
+    if (parsed.length === 0) return;
+    setQueueItems((prev) => [...prev, ...parsed]);
+    setBulkRawText('');
+  };
+
+  const handleCsvFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    const parsed = parseBulkInputToQueueItems(text);
+    if (parsed.length > 0) {
+      setQueueItems((prev) => [...prev, ...parsed]);
+    }
+    e.target.value = '';
+  };
+
+  const handleLoadCuratedSixIntoQueue = () => {
+    const curatedQuestions = questions.filter((q) => q.youtubeSource);
+    const existingUrls = new Set(queueItems.map((item) => item.url));
+    const toAdd: BulkYoutubeQueueItem[] = [];
+
+    for (const q of curatedQuestions) {
+      if (!q.youtubeSource || existingUrls.has(q.youtubeSource.url)) continue;
+      toAdd.push({
+        id: generateId(),
+        url: q.youtubeSource.url,
+        startTime: q.youtubeSource.startTime || '00:20',
+        endTime: q.youtubeSource.endTime || '01:35',
+        speaker: q.youtubeSource.speaker || q.sourceAttribution || 'Curated Talk',
+        targetMode: q.skill === 'listening' ? 'dictogloss' : 'shadowing',
+        existingQuestionId: q.id,
+        clipKey: q.youtubeSource.clipKey,
+        status: q.audioUrl ? 'done' : 'queued',
+        audioUrl: normalizeAudioUrl(q.audioUrl),
+        message: q.audioUrl ? 'Already downloaded on disk' : 'Ready in queue',
+      });
+    }
+    setQueueItems((prev) => [...prev, ...toAdd]);
+  };
+
+  const handleAddBlankRow = () => {
+    setQueueItems((prev) => [
+      ...prev,
+      {
+        id: generateId(),
+        url: '',
+        startTime: '00:20',
+        endTime: '01:35',
+        speaker: 'Custom Academic Speaker',
+        targetMode: 'shadowing',
+        status: 'queued',
+      },
+    ]);
+  };
+
+  const handleDownloadSampleCsv = () => {
+    const sample = [
+      'url,startTime,endTime,speaker,mode',
+      'https://www.youtube.com/watch?v=RKK7wGAYP6k,00:20,01:35,Prof. Lera Boroditsky - TED,shadowing',
+      'https://www.youtube.com/watch?v=LNHBMFCzznE,00:30,01:45,Dr. Lara Boyd - Neuroplasticity,shadowing',
+      'https://www.youtube.com/watch?v=eIho2S0ZahI,00:20,01:35,Julian Treasure - Prosody,dictogloss',
+    ].join('\n');
+    const blob = new Blob([sample], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'youtube_shadowing_template.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const updateQueueRow = (id: string, patch: Partial<BulkYoutubeQueueItem>) => {
+    setQueueItems((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    );
+  };
+
+  const removeQueueRow = (id: string) => {
+    setQueueItems((prev) => prev.filter((item) => item.id !== id));
+  };
+
+  const handleRunQueueSequentially = async () => {
+    if (isProcessingQueue) return;
+    setIsProcessingQueue(true);
+    stopQueueRef.current = false;
+
+    for (const item of queueItems) {
+      if (stopQueueRef.current) break;
+      if (item.status === 'done' || !item.url.trim().startsWith('http')) continue;
+
+      updateQueueRow(item.id, {
+        status: 'processing',
+        message: 'Downloading slice via yt-dlp & transcribing on GPU...',
+      });
+
+      const clipKey = item.clipKey || `yt_${item.id.slice(0, 8)}`;
+      try {
+        const res = await fetch(`${BACKEND_BASE}/audio/youtube`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: item.url.trim(),
+            startTime: item.startTime.trim() || '00:20',
+            endTime: item.endTime.trim() || '01:35',
+            clipKey,
+          }),
+        });
+
+        if (!res.ok) {
+          const errObj = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+          throw new Error(errObj.detail || `Server returned ${res.status}`);
+        }
+
+        const data = (await res.json()) as {
+          audioUrl: string;
+          text: string;
+          duration: number;
+        };
+
+        const normalizedUrl = normalizeAudioUrl(data.audioUrl);
+        const targetQuestionId = item.existingQuestionId || `yt-custom-${item.id.slice(0, 8)}`;
+        const existingQ = questions.find((q) => q.id === targetQuestionId);
+
+        const newOrUpdatedQuestion: QuestionBankItem = existingQ
+          ? {
+              ...existingQ,
+              audioUrl: normalizedUrl,
+              sourceAudioText: data.text || existingQ.sourceAudioText,
+              prompt: data.text || existingQ.prompt,
+              sourceAttribution: item.speaker || existingQ.sourceAttribution,
+            }
+          : {
+              id: targetQuestionId,
+              skill: item.targetMode === 'dictogloss' ? 'listening' : 'speaking',
+              type: item.targetMode === 'dictogloss' ? 'listen-and-type' : 'read-aloud',
+              sourceAttribution: item.speaker || 'YouTube Human Audio',
+              prompt:
+                data.text ||
+                `[${item.speaker}] Audio Clip (${item.startTime} - ${item.endTime})`,
+              sourceAudioText: data.text,
+              audioUrl: normalizedUrl,
+              youtubeSource: {
+                clipKey,
+                url: item.url.trim(),
+                startTime: item.startTime.trim() || '00:20',
+                endTime: item.endTime.trim() || '01:35',
+                speaker: item.speaker || 'YouTube Speaker',
+              },
+              difficulty: 'hard',
+              tags: [
+                item.targetMode === 'dictogloss' ? 'dictogloss' : 'shadowing',
+                'youtube',
+                'human-audio',
+              ],
+            };
+
+        await saveQuestion(newOrUpdatedQuestion);
+        updateQueueRow(item.id, {
+          status: 'done',
+          audioUrl: normalizedUrl,
+          message: `✓ Saved (${data.duration}s) — "${(data.text || '').slice(0, 65)}..."`,
+        });
+      } catch (err) {
+        updateQueueRow(item.id, {
+          status: 'error',
+          message:
+            err instanceof Error
+              ? err.message
+              : 'Failed to connect to stt-backend on port 8000',
+        });
+      }
+    }
+
+    setIsProcessingQueue(false);
+  };
+
+  // =========================================================================
+  // SINGLE QUESTION MODAL HANDLERS
+  // =========================================================================
   const openEditor = (q: QuestionBankItem) => {
-    setEditingQuestion({ ...q });
+    setEditingQuestion({ ...q, audioUrl: normalizeAudioUrl(q.audioUrl) });
     setChunksInput((q.targetChunks ?? []).join(', '));
     setTagsInput((q.tags ?? []).join(', '));
     setRcTitle(q.readAndComplete?.title ?? q.prompt ?? '');
-    setRcSource(q.readAndComplete?.sourceName ?? q.sourceAttribution ?? 'BBC Science Focus / The Conversation');
+    setRcSource(
+      q.readAndComplete?.sourceName ??
+        q.sourceAttribution ??
+        'BBC Science Focus / The Conversation'
+    );
     setRcBracketText(readAndCompleteToBracketText(q.readAndComplete));
     setYtUrl(q.youtubeSource?.url ?? '');
     setYtStart(q.youtubeSource?.startTime ?? '00:20');
@@ -178,54 +447,6 @@ export function QuestionBankEditor() {
     });
   };
 
-  const handleBatchDownloadCuratedYoutube = async () => {
-    const ytQuestions = questions.filter((q) => q.youtubeSource && !q.audioUrl);
-    if (ytQuestions.length === 0) {
-      setBatchStatus('✓ All curated YouTube shadowing talks are already downloaded to your device!');
-      return;
-    }
-    setBatchDownloading(true);
-    let completed = 0;
-
-    for (const q of ytQuestions) {
-      if (!q.youtubeSource) continue;
-      setBatchStatus(
-        `Downloading & GPU-transcribing (${completed + 1}/${ytQuestions.length}): ${q.youtubeSource.speaker}...`
-      );
-      try {
-        const res = await fetch(`${BACKEND_BASE}/audio/youtube`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            url: q.youtubeSource.url,
-            startTime: q.youtubeSource.startTime,
-            endTime: q.youtubeSource.endTime,
-            clipKey: q.youtubeSource.clipKey,
-          }),
-        });
-        if (res.ok) {
-          const data = (await res.json()) as { audioUrl: string; text: string };
-          await saveQuestion({
-            ...q,
-            audioUrl: data.audioUrl,
-            sourceAudioText: data.text || q.sourceAudioText,
-            prompt: data.text || q.prompt,
-          });
-          completed += 1;
-        }
-      } catch {
-        // Continue to next clip
-      }
-    }
-
-    setBatchDownloading(false);
-    setBatchStatus(
-      completed > 0
-        ? `✓ Downloaded & transcribed ${completed} TED/Academic shadowing clips to stt-backend/audio_clips/!`
-        : '⚠️ Could not connect to stt-backend on port 8000 or yt-dlp/ffmpeg is missing.'
-    );
-  };
-
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !editingQuestion) return;
@@ -252,9 +473,10 @@ export function QuestionBankEditor() {
         duration: number;
       };
 
+      const cleanUrl = normalizeAudioUrl(data.audioUrl);
       setEditingQuestion({
         ...editingQuestion,
-        audioUrl: data.audioUrl,
+        audioUrl: cleanUrl,
         sourceAudioText: data.text || editingQuestion.sourceAudioText,
         prompt: editingQuestion.prompt || data.text,
       });
@@ -298,9 +520,10 @@ export function QuestionBankEditor() {
         duration: number;
       };
 
+      const cleanUrl = normalizeAudioUrl(data.audioUrl);
       setEditingQuestion({
         ...editingQuestion,
-        audioUrl: data.audioUrl,
+        audioUrl: cleanUrl,
         sourceAudioText: data.text || editingQuestion.sourceAudioText,
         prompt: editingQuestion.prompt || data.text,
       });
@@ -338,6 +561,7 @@ export function QuestionBankEditor() {
 
     await saveQuestion({
       ...editingQuestion,
+      audioUrl: normalizeAudioUrl(editingQuestion.audioUrl),
       prompt: updatedPrompt,
       sourceAttribution: rcSource || editingQuestion.sourceAttribution,
       readAndComplete: updatedReadAndComplete,
@@ -352,18 +576,27 @@ export function QuestionBankEditor() {
       ? parseBracketTextToReadAndComplete(rcBracketText, rcTitle, rcSource)
       : null;
 
+  const doneCount = queueItems.filter((i) => i.status === 'done').length;
+
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-xl font-bold text-slate-900">
-            Question Bank, Reading Builder & YouTube Shadowing Studio
+            Question Bank, Reading Builder & Bulk YouTube Studio
           </h2>
           <p className="text-sm text-slate-500 mt-0.5">
-            Create or edit Read & Complete letter-box passages, Interactive Reading suites, or auto-download curated TED talks.
+            Batch-download & GPU-transcribe YouTube links via CSV or paste, or build Read & Complete passages.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowBulkStudio((v) => !v)}
+            className="px-3.5 py-2 bg-slate-900 text-white text-xs font-bold rounded-lg hover:bg-slate-800 cursor-pointer"
+          >
+            {showBulkStudio ? '▾ Hide Bulk YouTube Studio' : '🎬 Open Bulk YouTube & CSV Studio'}
+          </button>
           <button
             type="button"
             onClick={handleNewReadAndComplete}
@@ -376,34 +609,238 @@ export function QuestionBankEditor() {
             onClick={handleNewGeneral}
             className="px-3.5 py-2 bg-primary-600 text-white text-xs font-bold rounded-lg hover:bg-primary-700 cursor-pointer"
           >
-            + New Question / Audio Drill
+            + New Single Question
           </button>
         </div>
       </div>
 
-      {!editingQuestion && (
-        <div className="bg-slate-900 text-white rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <span className="text-[11px] font-bold uppercase tracking-wider text-primary-400">
-              🎬 Built-In Curated TED & Academic Shadowing Library (6 Talks Linked)
-            </span>
-            <p className="text-xs text-slate-300 mt-0.5">
-              Includes Lera Boroditsky (TED & Duocon), Mustafa Suleyman (AI), Dr. Lara Boyd (Neuroplasticity), Julian Treasure, and Cambridge Linguistics.
-            </p>
-            {batchStatus && (
-              <p className="text-xs font-semibold text-amber-300 mt-1.5">{batchStatus}</p>
-            )}
+      {/* =================================================================== */}
+      {/* BULK YOUTUBE & CSV QUEUE DOWNLOADER + TRANSCRIBER STUDIO            */}
+      {/* =================================================================== */}
+      {!editingQuestion && showBulkStudio && (
+        <div className="bg-slate-900 text-white rounded-2xl p-5 space-y-4 shadow-md border border-slate-800">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
+            <div>
+              <span className="text-[11px] font-bold uppercase tracking-wider text-primary-400">
+                🎬 Bulk YouTube & CSV Queue Downloader + Faster-Whisper Transcriber
+              </span>
+              <p className="text-xs text-slate-300 mt-0.5">
+                Paste multiple YouTube URLs (or CSV rows) or upload a <code>.csv</code> / <code>.txt</code> file. Clips download one by one to <code>stt-backend/audio_clips/</code> and auto-save as Shadowing or Dictogloss drills.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleLoadCuratedSixIntoQueue}
+                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-primary-300 border border-slate-700 rounded-lg text-xs font-semibold cursor-pointer"
+              >
+                + Load 6 Built-In TED Talks
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadSampleCsv}
+                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-semibold cursor-pointer"
+              >
+                ⬇️ Sample CSV Template
+              </button>
+              <label className="px-3 py-1.5 bg-accent-600 hover:bg-accent-700 text-white rounded-lg text-xs font-bold cursor-pointer">
+                📂 Upload .CSV / .TXT File
+                <input
+                  type="file"
+                  accept=".csv,.txt"
+                  onChange={handleCsvFileUpload}
+                  className="hidden"
+                />
+              </label>
+            </div>
           </div>
-          <button
-            type="button"
-            disabled={batchDownloading}
-            onClick={handleBatchDownloadCuratedYoutube}
-            className="px-4 py-2.5 bg-primary-500 hover:bg-primary-600 text-slate-950 font-bold text-xs rounded-xl disabled:opacity-50 cursor-pointer shrink-0"
-          >
-            {batchDownloading
-              ? '⏳ Downloading & Transcribing...'
-              : '⬇️ Auto-Download All 6 YouTube Shadowing Clips to Device'}
-          </button>
+
+          {/* Multi-Line Paste Box */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+            <div className="lg:col-span-8 space-y-1.5">
+              <label className="block text-xs font-semibold text-slate-300">
+                Copy-Paste YouTube Links (one URL per line, OR CSV: <code>url, start, end, speaker, shadowing|dictogloss</code>):
+              </label>
+              <textarea
+                value={bulkRawText}
+                onChange={(e) => setBulkRawText(e.target.value)}
+                rows={3}
+                placeholder={`https://www.youtube.com/watch?v=RKK7wGAYP6k, 00:20, 01:35, Prof. Lera Boroditsky, shadowing\nhttps://www.youtube.com/watch?v=LNHBMFCzznE, 00:30, 01:45, Dr. Lara Boyd, dictogloss`}
+                className="w-full p-3 rounded-xl bg-slate-950 border border-slate-700 text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-primary-400"
+              />
+            </div>
+            <div className="lg:col-span-4 flex flex-col justify-end gap-2">
+              <button
+                type="button"
+                onClick={handleParseTextToQueue}
+                disabled={!bulkRawText.trim()}
+                className="w-full py-2.5 px-4 bg-primary-500 hover:bg-primary-400 text-slate-950 font-bold text-xs rounded-xl disabled:opacity-40 cursor-pointer"
+              >
+                + Parse & Add Pasted Links to Queue
+              </button>
+              <button
+                type="button"
+                onClick={handleAddBlankRow}
+                className="w-full py-2 px-4 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs rounded-xl border border-slate-700 cursor-pointer"
+              >
+                + Add Manual Empty Row
+              </button>
+            </div>
+          </div>
+
+          {/* Queue Table */}
+          {queueItems.length > 0 && (
+            <div className="space-y-3 pt-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-bold text-slate-300">
+                  Download & Transcription Queue ({doneCount} / {queueItems.length} completed)
+                </span>
+                <div className="flex items-center gap-2">
+                  {!isProcessingQueue ? (
+                    <button
+                      type="button"
+                      onClick={handleRunQueueSequentially}
+                      className="px-4 py-2 bg-green-500 hover:bg-green-400 text-slate-950 font-bold text-xs rounded-xl cursor-pointer shadow-xs"
+                    >
+                      ▶ Start Sequential Download & GPU Transcription ({queueItems.filter((i) => i.status !== 'done').length} pending)
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        stopQueueRef.current = true;
+                      }}
+                      className="px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-bold text-xs rounded-xl cursor-pointer"
+                    >
+                      ⏹ Stop Queue After Current Clip
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={isProcessingQueue}
+                    onClick={() => setQueueItems([])}
+                    className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-xl disabled:opacity-40 cursor-pointer"
+                  >
+                    Clear Queue
+                  </button>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-slate-400 font-semibold">
+                      <th className="p-2.5">#</th>
+                      <th className="p-2.5">YouTube URL</th>
+                      <th className="p-2.5 w-24">Start</th>
+                      <th className="p-2.5 w-24">End</th>
+                      <th className="p-2.5">Speaker / Title</th>
+                      <th className="p-2.5 w-36">Target Mode</th>
+                      <th className="p-2.5">Status / Transcript Preview</th>
+                      <th className="p-2.5 w-16"></th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/80">
+                    {queueItems.map((item, idx) => (
+                      <tr key={item.id} className="hover:bg-slate-900/60">
+                        <td className="p-2 font-mono text-slate-400">{idx + 1}</td>
+                        <td className="p-2">
+                          <input
+                            type="url"
+                            value={item.url}
+                            disabled={item.status === 'processing'}
+                            onChange={(e) => updateQueueRow(item.id, { url: e.target.value })}
+                            placeholder="https://www.youtube.com/watch?v=..."
+                            className="w-full min-w-[210px] px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs"
+                          />
+                        </td>
+                        <td className="p-2">
+                          <input
+                            type="text"
+                            value={item.startTime}
+                            disabled={item.status === 'processing'}
+                            onChange={(e) => updateQueueRow(item.id, { startTime: e.target.value })}
+                            className="w-20 px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs text-center"
+                          />
+                        </td>
+                        <td className="p-2">
+                          <input
+                            type="text"
+                            value={item.endTime}
+                            disabled={item.status === 'processing'}
+                            onChange={(e) => updateQueueRow(item.id, { endTime: e.target.value })}
+                            className="w-20 px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs text-center"
+                          />
+                        </td>
+                        <td className="p-2">
+                          <input
+                            type="text"
+                            value={item.speaker}
+                            disabled={item.status === 'processing'}
+                            onChange={(e) => updateQueueRow(item.id, { speaker: e.target.value })}
+                            className="w-full min-w-[150px] px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-100 text-xs"
+                          />
+                        </td>
+                        <td className="p-2">
+                          <select
+                            value={item.targetMode}
+                            disabled={item.status === 'processing'}
+                            onChange={(e) =>
+                              updateQueueRow(item.id, {
+                                targetMode: e.target.value as 'shadowing' | 'dictogloss',
+                              })
+                            }
+                            className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-100 text-xs"
+                          >
+                            <option value="shadowing">🗣️ Shadowing</option>
+                            <option value="dictogloss">🎧 Dictogloss</option>
+                          </select>
+                        </td>
+                        <td className="p-2">
+                          <div className="space-y-1">
+                            <span
+                              className={`inline-block px-2 py-0.5 rounded font-bold text-[11px] ${
+                                item.status === 'done'
+                                  ? 'bg-green-900/60 text-green-300 border border-green-700'
+                                  : item.status === 'processing'
+                                  ? 'bg-amber-900/60 text-amber-300 border border-amber-700 animate-pulse'
+                                  : item.status === 'error'
+                                  ? 'bg-red-900/60 text-red-300 border border-red-700'
+                                  : 'bg-slate-800 text-slate-300'
+                              }`}
+                            >
+                              {item.status === 'done'
+                                ? '✓ Saved'
+                                : item.status === 'processing'
+                                ? '⏳ Processing...'
+                                : item.status === 'error'
+                                ? '❌ Error'
+                                : 'Queued'}
+                            </span>
+                            {item.message && (
+                              <p className="text-[11px] text-slate-400 line-clamp-1">
+                                {item.message}
+                              </p>
+                            )}
+                          </div>
+                        </td>
+                        <td className="p-2 text-right">
+                          <button
+                            type="button"
+                            disabled={item.status === 'processing'}
+                            onClick={() => removeQueueRow(item.id)}
+                            className="text-slate-400 hover:text-red-400 px-2 py-1 cursor-pointer"
+                          >
+                            ✕
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -453,6 +890,11 @@ export function QuestionBankEditor() {
                       <span className="text-xs text-slate-600 font-mono font-semibold bg-slate-100 px-2 py-0.5 rounded">
                         {q.type}
                       </span>
+                      {q.sourceAttribution && (
+                        <span className="text-xs font-semibold text-slate-600">
+                          • {q.sourceAttribution}
+                        </span>
+                      )}
                       {q.readAndComplete && (
                         <span className="text-xs font-semibold px-2 py-0.5 rounded bg-purple-100 text-purple-800">
                           {q.readAndComplete.blanks.length} Letter-Box Words
@@ -476,7 +918,11 @@ export function QuestionBankEditor() {
                       </p>
                     )}
                     {q.audioUrl && (
-                      <audio controls src={q.audioUrl} className="h-8 w-full max-w-md mt-1" />
+                      <audio
+                        controls
+                        src={normalizeAudioUrl(q.audioUrl)}
+                        className="h-8 w-full max-w-md mt-1"
+                      />
                     )}
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
@@ -712,7 +1158,11 @@ export function QuestionBankEditor() {
               </div>
 
               {editingQuestion.audioUrl && (
-                <audio controls src={editingQuestion.audioUrl} className="w-full h-9" />
+                <audio
+                  controls
+                  src={normalizeAudioUrl(editingQuestion.audioUrl)}
+                  className="w-full h-9"
+                />
               )}
               {audioStatus && (
                 <div className="text-xs font-semibold text-green-700 bg-green-50 border border-green-200 rounded-lg p-2.5">

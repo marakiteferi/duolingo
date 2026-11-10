@@ -41,17 +41,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
+# Mounted at /clips (not /audio) to avoid intercepting OPTIONS preflight
+# on POST /audio/upload and POST /audio/youtube
+app.mount("/clips", StaticFiles(directory=AUDIO_DIR), name="clips")
 
 print("Loading Faster-Whisper model...")
 model = WhisperModel("large-v3-turbo", device="cuda", compute_type="int8_float16")
 print("Model loaded successfully!")
 
+def normalize_clip_url(url: str, filename: str) -> str:
+    if filename:
+        return f"http://127.0.0.1:8000/clips/{filename}"
+    return url.replace("http://127.0.0.1:8000/audio/", "http://127.0.0.1:8000/clips/")
+
 def load_manifest() -> dict:
     if os.path.exists(MANIFEST_PATH):
         try:
             with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                raw = json.load(f)
+                for k, v in raw.items():
+                    if isinstance(v, dict):
+                        fname = v.get("filename", "")
+                        v["audioUrl"] = normalize_clip_url(v.get("audioUrl", ""), fname)
+                return raw
         except Exception:
             return {}
     return {}
@@ -102,6 +114,7 @@ async def get_audio_manifest():
     for k, v in manifest.items():
         fname = v.get("filename", "")
         if fname and os.path.exists(os.path.join(AUDIO_DIR, fname)):
+            v["audioUrl"] = f"http://127.0.0.1:8000/clips/{fname}"
             valid[k] = v
     return valid
 
@@ -133,7 +146,7 @@ async def upload_human_audio(
         transcript_data = run_whisper_on_file(dest_path, verbatim_prompt=False)
 
     return {
-        "audioUrl": f"http://127.0.0.1:8000/audio/{safe_name}",
+        "audioUrl": f"http://127.0.0.1:8000/clips/{safe_name}",
         "filename": safe_name,
         "text": transcript_data["text"],
         "timestampedText": transcript_data["timestampedText"],
@@ -151,8 +164,10 @@ async def import_youtube_clip(req: YoutubeClipRequest):
     manifest = load_manifest()
     if req.clipKey and req.clipKey in manifest:
         cached = manifest[req.clipKey]
-        cached_path = os.path.join(AUDIO_DIR, cached.get("filename", ""))
-        if os.path.exists(cached_path):
+        cached_fname = cached.get("filename", "")
+        cached_path = os.path.join(AUDIO_DIR, cached_fname)
+        if cached_fname and os.path.exists(cached_path):
+            cached["audioUrl"] = f"http://127.0.0.1:8000/clips/{cached_fname}"
             return cached
 
     clip_id = req.clipKey if req.clipKey else f"yt_{uuid.uuid4().hex[:10]}"
@@ -190,7 +205,7 @@ async def import_youtube_clip(req: YoutubeClipRequest):
     filename = os.path.basename(saved_file)
 
     result_payload = {
-        "audioUrl": f"http://127.0.0.1:8000/audio/{filename}",
+        "audioUrl": f"http://127.0.0.1:8000/clips/{filename}",
         "filename": filename,
         "text": transcript_data["text"],
         "timestampedText": transcript_data["timestampedText"],

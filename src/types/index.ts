@@ -133,6 +133,9 @@ export interface Block {
   preferredQuestionType?: DETQuestionType | 'adaptive';
   autoAdvance: boolean;
   evalPromptId: string;
+  blindShadowing?: boolean;
+  speechSpeed?: number;
+  communicativePressure?: boolean;
 }
 
 export type BlockConfig = Block;

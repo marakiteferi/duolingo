@@ -137,13 +137,16 @@ export function InteractiveReadingBlock({
 }) {
   const updateResponse = useSessionStore((s) => s.updateResponse);
 
+  const initialMode: 'interactive-reading' | 'read-and-complete' =
+    forcedMode ??
+    (block.preferredQuestionType === 'interactive-reading'
+      ? 'interactive-reading'
+      : 'read-and-complete');
+
   const [questions, setQuestions] = useState<QuestionBankItem[]>([]);
-  const [mode, setMode] = useState<'interactive-reading' | 'read-and-complete'>(
-    forcedMode ?? 'read-and-complete'
-  );
+  const [mode, setMode] = useState<'interactive-reading' | 'read-and-complete'>(initialMode);
   const [currentIdx, setCurrentIdx] = useState(0);
 
-  // Interactive Reading 6-step states
   const [step, setStep] = useState(0);
   const [clozeAnswers, setClozeAnswers] = useState<Record<string, string>>({});
   const [selectedGapSentence, setSelectedGapSentence] = useState<string>('');
@@ -153,7 +156,6 @@ export function InteractiveReadingBlock({
   const [selectedTitle, setSelectedTitle] = useState<string>('');
   const [submittedReading, setSubmittedReading] = useState(false);
 
-  // Read and Complete (C-Test) states
   const [prefixInputs, setPrefixInputs] = useState<Record<string, string>>({});
   const [submittedCloze, setSubmittedCloze] = useState(false);
   const [lastClozeScore, setLastClozeScore] = useState<{
@@ -163,8 +165,15 @@ export function InteractiveReadingBlock({
   } | null>(null);
 
   useEffect(() => {
-    if (forcedMode) setMode(forcedMode);
-  }, [forcedMode]);
+    if (forcedMode) {
+      setMode(forcedMode);
+    } else if (
+      block.preferredQuestionType === 'interactive-reading' ||
+      block.preferredQuestionType === 'read-and-complete'
+    ) {
+      setMode(block.preferredQuestionType);
+    }
+  }, [forcedMode, block.preferredQuestionType]);
 
   useEffect(() => {
     ensureDatabaseUpgraded()
@@ -176,8 +185,18 @@ export function InteractiveReadingBlock({
             (q.type === 'interactive-reading' || q.type === 'read-and-complete')
         );
         setQuestions(readingItems);
+
+        if (block.questionSetId) {
+          const pinned = readingItems.find((q) => q.id === block.questionSetId);
+          if (pinned && (pinned.type === 'read-and-complete' || pinned.type === 'interactive-reading')) {
+            setMode(pinned.type);
+            const subset = readingItems.filter((q) => q.type === pinned.type);
+            const idx = subset.findIndex((q) => q.id === pinned.id);
+            if (idx >= 0) setCurrentIdx(idx);
+          }
+        }
       });
-  }, []);
+  }, [block.questionSetId]);
 
   const filteredList = useMemo(
     () => questions.filter((q) => q.type === mode),
@@ -481,9 +500,17 @@ export function InteractiveReadingBlock({
             >
               ← Prev
             </button>
-            <span className="text-xs font-mono font-bold text-slate-700">
-              Passage {currentIdx + 1} of {filteredList.length}
-            </span>
+            <select
+              value={currentIdx}
+              onChange={(e) => handleSwitchPassage(Number(e.target.value))}
+              className="text-xs font-semibold text-slate-800 border border-slate-200 rounded-lg px-2 py-1"
+            >
+              {filteredList.map((item, idx) => (
+                <option key={item.id} value={idx}>
+                  Passage {idx + 1}: {item.readAndComplete?.title || item.prompt.slice(0, 42)}
+                </option>
+              ))}
+            </select>
             <button
               type="button"
               onClick={() => handleSwitchPassage((currentIdx + 1) % filteredList.length)}

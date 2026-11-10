@@ -8,6 +8,11 @@ import { WhisperLiveIndicator } from '../../common/WhisperLiveIndicator';
 
 const BACKEND_BASE = 'http://127.0.0.1:8000';
 
+function normalizeAudioUrl(url?: string): string {
+  if (!url) return '';
+  return url.replace('http://127.0.0.1:8000/audio/', 'http://127.0.0.1:8000/clips/');
+}
+
 function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -37,9 +42,9 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
 
   const [passages, setPassages] = useState<QuestionBankItem[]>([]);
   const [selectedIdx, setSelectedIdx] = useState(0);
-  const [speechRate, setSpeechRate] = useState<number>(1.0);
+  const [speechRate, setSpeechRate] = useState<number>(block.speechSpeed ?? 1.0);
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
-  const [hideTranscript, setHideTranscript] = useState(false);
+  const [hideTranscript, setHideTranscript] = useState<boolean>(Boolean(block.blindShadowing));
   const [downloadingYt, setDownloadingYt] = useState(false);
   const [recordingState, setRecordingState] = useState<'idle' | 'recording' | 'transcribing' | 'done'>('idle');
   const [recordingSeconds, setRecordingSeconds] = useState(0);
@@ -51,6 +56,11 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
   const recordDurationRef = useRef<number>(0);
 
   const response = draftResponses[block.id];
+
+  useEffect(() => {
+    if (block.speechSpeed) setSpeechRate(block.speechSpeed);
+    setHideTranscript(Boolean(block.blindShadowing));
+  }, [block.id, block.speechSpeed, block.blindShadowing]);
 
   const loadShadowingPassages = useCallback(async () => {
     const all = await db.questionBank.toArray();
@@ -70,14 +80,17 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
         const cached = manifest[q.youtubeSource.clipKey];
         const upgraded: QuestionBankItem = {
           ...q,
-          audioUrl: cached.audioUrl,
+          audioUrl: normalizeAudioUrl(cached.audioUrl),
           sourceAudioText: cached.text || q.sourceAudioText,
           prompt: cached.text || q.prompt,
         };
         await db.questionBank.put(upgraded);
         updatedItems.push(upgraded);
       } else {
-        updatedItems.push(q);
+        updatedItems.push({
+          ...q,
+          audioUrl: q.audioUrl ? normalizeAudioUrl(q.audioUrl) : q.audioUrl,
+        });
       }
     }
 
@@ -94,8 +107,14 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
         (b.audioUrl ? 2 : b.youtubeSource ? 1 : 0) -
         (a.audioUrl ? 2 : a.youtubeSource ? 1 : 0)
     );
-    setPassages(shadowItems.length > 0 ? shadowItems : updatedItems);
-  }, []);
+    const finalList = shadowItems.length > 0 ? shadowItems : updatedItems;
+    setPassages(finalList);
+
+    if (block.questionSetId) {
+      const pinnedIdx = finalList.findIndex((q) => q.id === block.questionSetId);
+      if (pinnedIdx >= 0) setSelectedIdx(pinnedIdx);
+    }
+  }, [block.questionSetId]);
 
   useEffect(() => {
     void loadShadowingPassages();
@@ -108,7 +127,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
   }, [loadShadowingPassages]);
 
   const currentItem = passages[selectedIdx];
-  const humanAudioUrl = currentItem?.audioUrl?.trim() || '';
+  const humanAudioUrl = normalizeAudioUrl(currentItem?.audioUrl?.trim());
   const ytSource = currentItem?.youtubeSource;
   const sourceText =
     currentItem?.sourceAudioText ||
@@ -149,7 +168,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
       };
       const updatedItem: QuestionBankItem = {
         ...currentItem,
-        audioUrl: data.audioUrl,
+        audioUrl: normalizeAudioUrl(data.audioUrl),
         sourceAudioText: data.text || currentItem.sourceAudioText,
         prompt: data.text || currentItem.prompt,
       };
@@ -256,6 +275,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
         timestampedTranscript: result.timestampedText || result.text,
         audioDurationSec: actualDuration,
         promptSnapshot: sourceText,
+        questionId: currentItem?.id,
         fillerCount: stats.fillerCount,
         wpm: stats.wpm,
       });
@@ -264,7 +284,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
       setError(err instanceof Error ? err.message : 'Shadowing transcription failed');
       setRecordingState('idle');
     }
-  }, [block.id, sourceText, stopNativeAudio, updateResponse]);
+  }, [block.id, currentItem?.id, sourceText, stopNativeAudio, updateResponse]);
 
   const matchPercent = computeWordMatchPercent(sourceText, response?.textOrTranscript ?? '');
 
@@ -307,16 +327,20 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
             </button>
           ))}
           {passages.length > 1 && (
-            <button
-              type="button"
-              onClick={() => {
+            <select
+              value={selectedIdx}
+              onChange={(e) => {
                 stopNativeAudio();
-                setSelectedIdx((i) => (i + 1) % passages.length);
+                setSelectedIdx(Number(e.target.value));
               }}
-              className="text-xs font-semibold text-primary-700 bg-primary-50 border border-primary-200 px-3 py-1 rounded-lg cursor-pointer"
+              className="text-xs font-semibold text-primary-800 bg-primary-50 border border-primary-200 px-2.5 py-1 rounded-lg cursor-pointer max-w-[220px]"
             >
-              Next Clip ({selectedIdx + 1}/{passages.length}) →
-            </button>
+              {passages.map((p, idx) => (
+                <option key={p.id} value={idx}>
+                  #{idx + 1} {p.sourceAttribution || p.prompt.slice(0, 35)}
+                </option>
+              ))}
+            </select>
           )}
         </div>
       </div>
