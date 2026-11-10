@@ -4,6 +4,7 @@ import { VocabWritingBlock } from './blocks/VocabWritingBlock';
 import { SpeakingBlock } from './blocks/SpeakingBlock';
 import { ShadowingBlock } from './blocks/ShadowingBlock';
 import { DictoglossBlock } from './blocks/DictoglossBlock';
+import { InteractiveReadingBlock } from './blocks/InteractiveReadingBlock';
 import { MockTestBlock } from './blocks/MockTestBlock';
 import { CustomBlock } from './blocks/CustomBlock';
 
@@ -13,6 +14,8 @@ interface BlockInputRouterProps {
 
 export function BlockInputRouter({ block }: BlockInputRouterProps) {
   switch (block.type) {
+    case 'interactive-reading':
+      return <InteractiveReadingBlock block={block} />;
     case 'brain-dump':
       return <BrainDumpBlock block={block} />;
     case 'vocab-writing':
