@@ -1,0 +1,2390 @@
+// upgrade-21day-phase1-bank-and-types.mjs
+// Phase 1 of 3: Purges personalized CS/AI/Security prompts, seeds 60+ authentic general DET questions
+// & 15 C1/C2 collocation chunk sets, and adds Unseen-First non-repeating question tracking.
+// Run from project root: node upgrade-21day-phase1-bank-and-types.mjs
+
+import fs from 'node:fs';
+import path from 'node:path';
+
+const files = {
+  // =========================================================================
+  // 1. TYPES: Add 21-Day Plan & Question Completion Tracking
+  // =========================================================================
+  'src/types/index.ts': `export type DETSkill = 'reading' | 'writing' | 'speaking' | 'listening';
+
+export type DETQuestionType =
+  | 'interactive-reading'
+  | 'read-and-complete'
+  | 'read-aloud'
+  | 'write-about-photo'
+  | 'listen-and-type'
+  | 'interactive-writing'
+  | 'interactive-speaking'
+  | 'speaking-sample';
+
+export type BlockType =
+  | 'interactive-reading'
+  | 'brain-dump'
+  | 'vocab-writing'
+  | 'speaking'
+  | 'shadowing'
+  | 'dictogloss'
+  | 'mock-test'
+  | 'custom';
+
+export type STTProvider = 'local-whisper' | 'whisper' | 'web-speech-api';
+export type ViewMode = 'config' | 'exam';
+export type AppView = ViewMode;
+export type SessionStatus = 'in-progress' | 'completed' | 'abandoned';
+export type ScoreScale = 'det-0-160' | 'custom';
+export type ConfigSection = 'templates' | 'questions' | 'eval-prompts' | 'history' | 'settings';
+
+export interface SRSData {
+  easeFactor: number;
+  intervalDays: number;
+  repetitions: number;
+  nextReviewDate: string;
+}
+
+export interface SRSDefaults {
+  startEase: number;
+  startIntervalDays: number;
+}
+
+export interface Settings {
+  id: 'app-settings';
+  geminiApiKey: string;
+  sttProvider: STTProvider;
+  localWhisperUrl?: string;
+  localSttEndpoint?: string;
+  sttApiKey?: string;
+  autoAdvanceDefault: boolean;
+  instantFeedbackDefault?: boolean;
+  srsDefaults: SRSDefaults;
+  studyPlanStartDate?: string;
+  currentPlanDay?: number;
+  completedPlanSlots?: Record<string, string>; // key: "day-1-session-1" -> ISO timestamp
+}
+
+export interface ClozeBlankItem {
+  id: string;
+  options: string[];
+  correctAnswer: string;
+}
+
+export interface InteractiveReadingData {
+  sourceName: string;
+  paragraph1WithBlanks: string;
+  paragraph1Sentences: string[];
+  blanks: ClozeBlankItem[];
+  passageGapOptions: string[];
+  correctPassageGap: string;
+  paragraph2Sentences: string[];
+  highlightQuestion1: string;
+  correctHighlight1: string;
+  highlightQuestion2: string;
+  correctHighlight2: string;
+  mainIdeaOptions: string[];
+  correctMainIdea: string;
+  titleOptions: string[];
+  correctTitle: string;
+}
+
+export interface ReadAndCompleteBlank {
+  id: string;
+  prefix: string;
+  missingSuffix: string;
+  fullWord: string;
+}
+
+export interface ReadAndCompleteData {
+  sourceName: string;
+  title: string;
+  passageWithBlanks: string;
+  blanks: ReadAndCompleteBlank[];
+}
+
+export interface YoutubeAudioSource {
+  clipKey: string;
+  url: string;
+  startTime: string;
+  endTime: string;
+  speaker: string;
+}
+
+export interface QuestionBankItem {
+  id: string;
+  skill: DETSkill;
+  type: DETQuestionType;
+  prompt: string;
+  sampleAnswer?: string;
+  sourceAttribution?: string;
+  targetChunks?: string[];
+  sourceAudioText?: string;
+  audioUrl?: string;
+  youtubeSource?: YoutubeAudioSource;
+  interactiveReading?: InteractiveReadingData;
+  readAndComplete?: ReadAndCompleteData;
+  difficulty: number | 'easy' | 'mid' | 'hard';
+  tags: string[];
+  srs?: SRSData;
+  dayNumber?: number; // 1 to 21 assignment
+  completedAt?: string | null;
+  timesCompleted?: number;
+}
+
+export interface EvalPrompt {
+  id: string;
+  name: string;
+  appliesToType: BlockType;
+  promptText: string;
+  scoreScale: ScoreScale;
+}
+
+export interface Block {
+  id: string;
+  name: string;
+  type: BlockType;
+  durationSec: number;
+  instructions: string;
+  questionSetId?: string;
+  preferredQuestionType?: DETQuestionType | 'adaptive';
+  autoAdvance: boolean;
+  evalPromptId: string;
+  blindShadowing?: boolean;
+  speechSpeed?: number;
+  communicativePressure?: boolean;
+}
+
+export type BlockConfig = Block;
+
+export interface SessionTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  blocks: Block[];
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+}
+
+export interface AIFeedback {
+  overallScore?: number;
+  subscores: Record<string, number>;
+  criteria: Record<string, string>;
+  strengths: string[];
+  weaknesses: string[];
+  suggestions: string[];
+  suggestedFix?: string;
+  note?: string;
+}
+
+export interface BlockResponse {
+  blockId: string;
+  type?: BlockType;
+  questionType?: string;
+  questionId?: string;
+  promptSnapshot?: string;
+  textOrTranscript?: string;
+  timestampedTranscript?: string;
+  audioDurationSec?: number;
+  fragmentNotes?: string;
+  attemptCount?: number;
+  previousDraft?: string;
+  audioBlobRef?: string;
+  isComplete: boolean;
+  timeSpentSec: number;
+  fillerCount?: number;
+  wpm?: number;
+  aiSubscores?: Record<string, number>;
+  aiOverallScore?: number;
+  aiFeedback?: AIFeedback;
+  evalPendingOffline?: boolean;
+}
+
+export interface SessionSummary {
+  overallScore?: number;
+  perSkillScores?: Partial<Record<DETSkill, number>>;
+  durationSec: number;
+}
+
+export interface SessionRun {
+  id: string;
+  templateId: string | null;
+  templateName: string;
+  blockConfigs: BlockConfig[];
+  status: SessionStatus;
+  currentBlockIndex: number;
+  overallElapsedSec: number;
+  instantFeedback?: boolean;
+  communicativePressure?: boolean;
+  preferredQuestionType?: DETQuestionType | 'all' | 'adaptive';
+  planDay?: number;
+  planSlotIndex?: number;
+  startedAt: string;
+  endedAt: string | null;
+  responses: Record<string, BlockResponse>;
+  summary?: SessionSummary;
+}
+`,
+
+  // =========================================================================
+  // 2. DATABASE: Authentic General DET Question Bank & 3 Daily Templates
+  // =========================================================================
+  'src/db/database.ts': `import Dexie, { type Table } from 'dexie';
+import type {
+  Settings,
+  QuestionBankItem,
+  EvalPrompt,
+  SessionTemplate,
+  SessionRun,
+} from '../types';
+
+export const DEFAULT_WRITING_PROMPT = \`You are an expert Duolingo English Test (DET) evaluator. Grade the provided response against the official DET rubric, strictly calibrating for a target score band of 140-150 (C1/C2 academic proficiency). Focus on syntactic variety (subordination, relative clauses), natural collocation usage, and logical cohesion.
+
+Task / Prompt: {{prompt}}
+Verified Time Spent: {{durationSec}} seconds
+Student Response:
+{{response}}
+
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "overallScore": <number 0-160>,
+  "subscores": { "literacy": <0-160>, "comprehension": <0-160>, "conversation": <0-160>, "production": <0-160> },
+  "criteria": { "grammar": "<concise clause & syntax critique>", "vocabulary": "<collocation & lexical precision critique>", "coherence": "<transitions & structure assessment>" },
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<specific recurring error 1>", "<specific error 2>"],
+  "suggestions": ["<actionable fix 1>", "<actionable fix 2>"],
+  "suggestedFix": "<A 150-band C1/C2 rewrite of the student's weakest sentences>"
+}\`;
+
+export const DEFAULT_SPEAKING_PROMPT = \`You are an expert Duolingo English Test (DET) speaking evaluator. Grade the verbatim timestamped speech transcript against the official DET rubric for a target score band of 140-150.
+
+CRITICAL TIMING & TIMESTAMP INSTRUCTIONS:
+1. The student's ACTUAL verified total audio recording duration is {{durationSec}} seconds (Speaking rate: {{wpm}} WPM, Fillers detected: {{fillerCount}}). NEVER claim the student spoke for less than {{durationSec}} seconds.
+2. The transcript includes exact segment timestamps [start - end] and [PAUSE Xs] markers generated by Faster-Whisper. Use these timestamps to evaluate acoustic fluency, natural clause-boundary pacing, hesitation clusters ("uh", "um"), and mid-clause pauses.
+
+Speaking Task / Prompt: {{prompt}}
+Verified Total Recording Duration: {{durationSec}} seconds ({{wpm}} WPM, {{fillerCount}} fillers)
+Timestamped Verbatim Transcript:
+{{transcript}}
+
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "overallScore": <number 0-160>,
+  "subscores": { "literacy": <0-160>, "comprehension": <0-160>, "conversation": <0-160>, "production": <0-160> },
+  "criteria": { "fluency": "<pace, [PAUSE] analysis & duration assessment>", "lexical_diversity": "<collocations & academic chunks>", "grammar": "<spoken syntactic variety>" },
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<specific fluency/grammar gap 1>", "<specific gap 2>"],
+  "suggestions": ["<specific tip 1>", "<specific tip 2>"],
+  "suggestedFix": "<A natural 150-score spoken version incorporating strong collocations>"
+}\`;
+
+export const DEFAULT_SHADOWING_PROMPT = \`You are an SLA speech prosody and shadowing evaluator. Compare the source native passage against the student's simultaneous shadowed transcript (recorded over {{durationSec}} seconds). Evaluate word retention, chunk automaticity, and rhythm.
+
+Source Native Passage:
+{{prompt}}
+
+Student Shadowed Timestamped Transcript ({{durationSec}}s):
+{{transcript}}
+
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "overallScore": <number 0-160>,
+  "subscores": { "literacy": <0-160>, "comprehension": <0-160>, "conversation": <0-160>, "production": <0-160> },
+  "criteria": { "fluency": "<rhythm & pause synchronization>", "accuracy": "<dropped words or stumbled chunks>", "grammar": "<structural retention>" },
+  "strengths": ["<strength 1>"],
+  "weaknesses": ["<dropped or hesitated chunk>"],
+  "suggestions": ["<motor-auditory shadowing drill tip>"],
+  "suggestedFix": "<Key multi-word chunks from the source passage to drill aloud>"
+}\`;
+
+export const DEFAULT_DICTOGLOSS_PROMPT = \`You are an SLA Dictogloss working-memory and syntactic reconstruction evaluator. Grade how accurately the student reconstructed the core meaning of the source lecture passage using their own complex subordination and academic collocations (do NOT require verbatim word matching).
+
+Original Lecture Passage:
+{{prompt}}
+
+Student Reconstructed Text (Time spent: {{durationSec}}s):
+{{response}}
+
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "overallScore": <number 0-160>,
+  "subscores": { "literacy": <0-160>, "comprehension": <0-160>, "conversation": <0-160>, "production": <0-160> },
+  "criteria": { "comprehension": "<retention of core thesis & causal links>", "grammar": "<subordination & clause embedding>", "vocabulary": "<academic collocations>" },
+  "strengths": ["<strength 1>"],
+  "weaknesses": ["<missing nuance or syntactic weakness>"],
+  "suggestions": ["<note-taking compression or syntax tip>"],
+  "suggestedFix": "<A 150-band C1/C2 reconstruction of the passage>"
+}\`;
+
+// IDs of old personalized CS/AI/Security questions to purge automatically
+export const OBSOLETE_PERSONALIZED_IDS = new Set([
+  'ir-conversation-ai-economics',
+  'rc-conversation-orbital-datacenters',
+  'rc-conversation-quantum-repeaters',
+  'rc-conversation-neuromorphic-vision',
+  'yt-suleyman-ai',
+  'vw-chunks-ai-research',
+  'vw-chunks-algorithmic-governance',
+  'vw-chunks-neurotechnology-ethics',
+  'vw-chunks-cybersecurity-patching',
+  'iw-education-ai-defense',
+  'iw-open-source-vs-proprietary-ai',
+  'sp-ai-security-tradeoffs',
+  'sp-complex-architecture',
+  'sp-climate-computing-footprint',
+  'sp-neurotech-workplace',
+  'sh-static-analysis-critics',
+]);
+
+export function buildRichQuestionBank(): QuestionBankItem[] {
+  return [
+    // =====================================================================
+    // PART A: 7 INTERACTIVE READING (6-Step Suites — General DET Topics)
+    // =====================================================================
+    {
+      id: 'ir-det-urban-transit',
+      dayNumber: 1,
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'Urban Planning & Civic Infrastructure',
+      prompt: 'Interactive Reading: Bus Rapid Transit and Urban Mobility',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'urban-planning', 'transit'],
+      interactiveReading: {
+        sourceName: 'Journal of Urban Mobility — Public Transit',
+        paragraph1WithBlanks:
+          'As metropolitan populations expand, municipal governments face mounting pressure to {{1}} severe traffic congestion without exhausting public budgets. While underground subways provide high passenger capacity, their construction requires massive capital {{2}} and decades of disruptive excavation. Consequently, many mid-sized cities have {{3}} Bus Rapid Transit (BRT) networks, which repurpose existing roadways into dedicated bus corridors {{4}} from private automobile traffic.',
+        paragraph1Sentences: [
+          'As metropolitan populations expand, municipal governments face mounting pressure to alleviate severe traffic congestion without exhausting public budgets.',
+          'While underground subways provide high passenger capacity, their construction requires massive capital investment and decades of disruptive excavation.',
+          'Consequently, many mid-sized cities have adopted Bus Rapid Transit (BRT) networks, which repurpose existing roadways into dedicated bus corridors separated from private automobile traffic.',
+        ],
+        blanks: [
+          { id: '1', options: ['alleviate', 'aggravate', 'endorse', 'conceal'], correctAnswer: 'alleviate' },
+          { id: '2', options: ['investment', 'indifference', 'scarcity', 'Hesitation'], correctAnswer: 'investment' },
+          { id: '3', options: ['adopted', 'abandoned', 'prohibited', 'obscured'], correctAnswer: 'adopted' },
+          { id: '4', options: ['separated', 'merged', 'derived', 'borrowed'], correctAnswer: 'separated' },
+        ],
+        passageGapOptions: [
+          'Beyond dedicated lanes, effective BRT systems incorporate features that mimic the speed and reliability of light rail.',
+          'Nevertheless, bicycle manufacturing declined sharply across European capitals during the nineteenth century.',
+          'As a result, municipal authorities have abolished all pedestrian crosswalks in commercial districts.',
+          'Conversely, underground subways require zero maintenance once initial tunnel excavation is complete.',
+        ],
+        correctPassageGap:
+          'Beyond dedicated lanes, effective BRT systems incorporate features that mimic the speed and reliability of light rail.',
+        paragraph2Sentences: [
+          'Passengers pay their fares at elevated station platforms prior to boarding, eliminating the delays caused by paying the driver at a single front door.',
+          'Furthermore, traffic-signal priority sensors detect approaching buses and extend green lights at major intersections.',
+          'Empirical evaluations in South America and Asia demonstrate that well-designed BRT corridors can reduce average commute times by thirty percent while cutting per-passenger carbon emissions.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that explains why building underground subways is often impractical for mid-sized cities.',
+        correctHighlight1:
+          'While underground subways provide high passenger capacity, their construction requires massive capital investment and decades of disruptive excavation.',
+        highlightQuestion2:
+          'Click the sentence that describes how station design speeds up passenger boarding.',
+        correctHighlight2:
+          'Passengers pay their fares at elevated station platforms prior to boarding, eliminating the delays caused by paying the driver at a single front door.',
+        mainIdeaOptions: [
+          'Bus Rapid Transit offers cities a cost-effective, low-emission alternative to subways by combining dedicated lanes, pre-boarding fare collection, and signal priority.',
+          'Underground subways are the only viable transportation solution for modern metropolitan areas.',
+          'Traffic-signal sensors frequently malfunction during peak commuting hours in large cities.',
+          'Private automobiles produce fewer emissions per passenger than municipal bus networks.',
+        ],
+        correctMainIdea:
+          'Bus Rapid Transit offers cities a cost-effective, low-emission alternative to subways by combining dedicated lanes, pre-boarding fare collection, and signal priority.',
+        titleOptions: [
+          'Rethinking the Commute: How Bus Rapid Transit Delivers Subway Speed at a Fraction of the Cost',
+          'The Architectural History of Nineteenth-Century Underground Rail',
+          'Why Municipal Governments Are Eliminating Public Bus Routes',
+          'A Comparative Study of Highway Toll Collection Methods',
+        ],
+        correctTitle:
+          'Rethinking the Commute: How Bus Rapid Transit Delivers Subway Speed at a Fraction of the Cost',
+      },
+    },
+    {
+      id: 'ir-det-art-restoration',
+      dayNumber: 4,
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'Cultural Heritage & Museum Conservation',
+      prompt: 'Interactive Reading: Non-Invasive Imaging in Fine Art Restoration',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'arts', 'history'],
+      interactiveReading: {
+        sourceName: 'Museum Conservation Quarterly — Fine Arts',
+        paragraph1WithBlanks:
+          'For centuries, art conservators attempting to remove darkened varnish from Renaissance paintings had to {{1}} on chemical solvents that risked stripping away the artist’s original pigments. Because historical masters frequently mixed delicate glazes into their top layers, even a {{2}} miscalculation during cleaning could permanently flatten the visual depth of a masterpiece. Today, conservation laboratories utilize non-invasive spectral imaging to {{3}} the chemical composition of every microscopic paint layer before a single cotton swab {{4}} the canvas.',
+        paragraph1Sentences: [
+          'For centuries, art conservators attempting to remove darkened varnish from Renaissance paintings had to rely on chemical solvents that risked stripping away the artist’s original pigments.',
+          'Because historical masters frequently mixed delicate glazes into their top layers, even a minor miscalculation during cleaning could permanently flatten the visual depth of a masterpiece.',
+          'Today, conservation laboratories utilize non-invasive spectral imaging to map the chemical composition of every microscopic paint layer before a single cotton swab touches the canvas.',
+        ],
+        blanks: [
+          { id: '1', options: ['rely', 'infringe', 'speculate', 'elaborate'], correctAnswer: 'rely' },
+          { id: '2', options: ['minor', 'deliberate', 'beneficial', 'gigantic'], correctAnswer: 'minor' },
+          { id: '3', options: ['map', 'erode', 'conceal', 'fabricate'], correctAnswer: 'map' },
+          { id: '4', options: ['touches', 'abandons', 'ignores', 'frames'], correctAnswer: 'touches' },
+        ],
+        passageGapOptions: [
+          'In addition to guiding safe cleaning, these imaging techniques have revealed hidden preliminary sketches and abandoned compositions beneath the visible surface.',
+          'Consequently, modern museums have stopped exhibiting paintings created prior to the twentieth century.',
+          'On the other hand, Renaissance painters never applied protective varnish to oil paintings.',
+          'Therefore, chemical solvents are now sprayed directly onto unframed canvases without testing.',
+        ],
+        correctPassageGap:
+          'In addition to guiding safe cleaning, these imaging techniques have revealed hidden preliminary sketches and abandoned compositions beneath the visible surface.',
+        paragraph2Sentences: [
+          'Macro X-ray fluorescence scanning detects heavy elements such as lead, mercury, and cobalt below the top coat of paint.',
+          'Art historians can thus observe how a painter revised the posture of a portrait subject or painted over an entire background figure.',
+          'This marriage of analytical chemistry and art history ensures that cultural treasures are preserved authentically for future generations.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that explains why traditional solvent cleaning was hazardous to Renaissance paintings.',
+        correctHighlight1:
+          'Because historical masters frequently mixed delicate glazes into their top layers, even a minor miscalculation during cleaning could permanently flatten the visual depth of a masterpiece.',
+        highlightQuestion2:
+          'Click the sentence that identifies the specific scanning technology used to detect underlying chemical elements like lead and cobalt.',
+        correctHighlight2:
+          'Macro X-ray fluorescence scanning detects heavy elements such as lead, mercury, and cobalt below the top coat of paint.',
+        mainIdeaOptions: [
+          'Non-invasive spectral and X-ray imaging allows conservators to clean historical paintings safely while uncovering hidden artistic revisions beneath the surface.',
+          'Renaissance artists preferred cobalt and mercury pigments because they were inexpensive to mine.',
+          'Chemical solvents remain the only way to detect preliminary sketches under oil paintings.',
+          'Art historians discourage museums from removing darkened varnish from old portraits.',
+        ],
+        correctMainIdea:
+          'Non-invasive spectral and X-ray imaging allows conservators to clean historical paintings safely while uncovering hidden artistic revisions beneath the surface.',
+        titleOptions: [
+          'Beneath the Brushstrokes: How Non-Invasive Imaging Is Transforming Art Conservation',
+          'The Economic Decline of Oil Painting in Renaissance Italy',
+          'Why Modern Museums Prefer Reproductions Over Original Canvases',
+          'A Beginner’s Guide to Mixing Acrylic Glazes',
+        ],
+        correctTitle:
+          'Beneath the Brushstrokes: How Non-Invasive Imaging Is Transforming Art Conservation',
+      },
+    },
+    {
+      id: 'ir-det-behavioral-economics',
+      dayNumber: 7,
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'Behavioral Economics & Public Policy',
+      prompt: 'Interactive Reading: Default Options and Consumer Decision-Making',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'economics', 'psychology'],
+      interactiveReading: {
+        sourceName: 'Behavioral Policy Review — Choice Architecture',
+        paragraph1WithBlanks:
+          'Classical economic theory long assumed that consumers evaluate every financial and lifestyle choice through {{1}} calculation, weighing all available data to maximize personal utility. In practice, however, human attention is a {{2}} resource, and individuals confronted with complex paperwork frequently exhibit status-quo bias. Behavioral economists have shown that simply changing the {{3}} option on an enrollment form can dramatically alter participation rates without {{4}} anyone’s freedom of choice.',
+        paragraph1Sentences: [
+          'Classical economic theory long assumed that consumers evaluate every financial and lifestyle choice through rational calculation, weighing all available data to maximize personal utility.',
+          'In practice, however, human attention is a finite resource, and individuals confronted with complex paperwork frequently exhibit status-quo bias.',
+          'Behavioral economists have shown that simply changing the default option on an enrollment form can dramatically alter participation rates without restricting anyone’s freedom of choice.',
+        ],
+        blanks: [
+          { id: '1', options: ['rational', 'impulsive', 'accidental', 'negligent'], correctAnswer: 'rational' },
+          { id: '2', options: ['finite', 'boundless', 'permanent', 'redundant'], correctAnswer: 'finite' },
+          { id: '3', options: ['default', 'obscure', 'prohibited', 'retroactive'], correctAnswer: 'default' },
+          { id: '4', options: ['restricting', 'preserving', 'acknowledging', 'expanding'], correctAnswer: 'restricting' },
+        ],
+        passageGapOptions: [
+          'This principle, known as choice architecture, has produced striking results in both retirement savings and environmental conservation.',
+          'As a result, classical economists have recommended banning all retirement savings accounts.',
+          'In contrast, status-quo bias only affects individuals who hold advanced degrees in mathematics.',
+          'Consequently, utility companies no longer allow customers to choose their electricity provider.',
+        ],
+        correctPassageGap:
+          'This principle, known as choice architecture, has produced striking results in both retirement savings and environmental conservation.',
+        paragraph2Sentences: [
+          'When employers automatically enroll new hires into a pension plan while allowing them to opt out at any time, participation jumps from under fifty percent to over eighty-five percent.',
+          'Similarly, municipalities that set renewable green energy as the standard household tariff observe sustained adoption rates above eighty percent.',
+          'Policymakers emphasize that ethical choice architecture must remain transparent and easy to reverse so that nudges empower rather than manipulate citizens.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that explains why people often stick with the pre-selected status quo when facing complicated forms.',
+        correctHighlight1:
+          'In practice, however, human attention is a finite resource, and individuals confronted with complex paperwork frequently exhibit status-quo bias.',
+        highlightQuestion2:
+          'Click the sentence that describes the ethical safeguard policymakers require when designing behavioral nudges.',
+        correctHighlight2:
+          'Policymakers emphasize that ethical choice architecture must remain transparent and easy to reverse so that nudges empower rather than manipulate citizens.',
+        mainIdeaOptions: [
+          'Because human attention is limited, thoughtfully designed default options can significantly boost positive outcomes like retirement savings and green energy adoption while preserving personal choice.',
+          'Mandatory government regulations are more popular than voluntary opt-out programs.',
+          'Classical economic theory accurately predicts that people read every page of financial contracts.',
+          'Renewable energy tariffs are too expensive for municipalities to offer as a standard option.',
+        ],
+        correctMainIdea:
+          'Because human attention is limited, thoughtfully designed default options can significantly boost positive outcomes like retirement savings and green energy adoption while preserving personal choice.',
+        titleOptions: [
+          'The Power of the Default: How Choice Architecture Shapes Everyday Decisions',
+          'Why Employees Are Abandoning Corporate Pension Plans',
+          'A Historical Critique of Nineteenth-Century Banking',
+          'Eliminating Consumer Choice in Municipal Electricity Markets',
+        ],
+        correctTitle:
+          'The Power of the Default: How Choice Architecture Shapes Everyday Decisions',
+      },
+    },
+    {
+      id: 'ir-bbc-atlantic-mosquitoes',
+      dayNumber: 10,
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'BBC Science Focus (Ecology & Biodiversity)',
+      prompt: 'Interactive Reading: Forest Fragmentation and Wildlife Habitat Buffers',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'bbc', 'ecology'],
+      interactiveReading: {
+        sourceName: 'BBC Science Focus — Forest Ecology',
+        paragraph1WithBlanks:
+          'Disease-carrying mosquitoes in Brazil’s Atlantic Forest are increasingly {{1}} humans over wild animals, raising urgent concerns that habitat degradation is pushing dangerous vectors closer to human settlements. When researchers captured engorged female mosquitoes inside protected nature reserves and sequenced the DNA of their blood meals, they discovered a striking {{2}} for human hosts. Nearly three-quarters of the analyzed blood meals originated from humans, a finding that {{3}} the research team given that the light traps were positioned deep inside forested reserves with {{4}} human presence.',
+        paragraph1Sentences: [
+          'Disease-carrying mosquitoes in Brazil’s Atlantic Forest are increasingly targeting humans over wild animals, raising urgent concerns that habitat degradation is pushing dangerous vectors closer to human settlements.',
+          'When researchers captured engorged female mosquitoes inside protected nature reserves and sequenced the DNA of their blood meals, they discovered a striking preference for human hosts.',
+          'Nearly three-quarters of the analyzed blood meals originated from humans, a finding that surprised the research team given that the light traps were positioned deep inside forested reserves with minimal human presence.',
+        ],
+        blanks: [
+          { id: '1', options: ['targeting', 'evading', 'nourishing', 'sheltering'], correctAnswer: 'targeting' },
+          { id: '2', options: ['preference', 'aversion', 'indifference', 'immunity'], correctAnswer: 'preference' },
+          { id: '3', options: ['surprised', 'reassured', 'discredited', 'pacified'], correctAnswer: 'surprised' },
+          { id: '4', options: ['minimal', 'excessive', 'universal', 'mandatory'], correctAnswer: 'minimal' },
+        ],
+        passageGapOptions: [
+          'The genetic evidence suggests that mosquitoes are flying out of the forest reserves to feed on nearby residents before returning to the canopy to rest.',
+          'As a result, entomologists concluded that female mosquitoes no longer require blood meals to develop their eggs.',
+          'Meanwhile, urban architects have begun constructing taller apartment buildings across South America.',
+          'Conversely, DNA sequencing cannot distinguish between mammalian and avian blood samples.',
+        ],
+        correctPassageGap:
+          'The genetic evidence suggests that mosquitoes are flying out of the forest reserves to feed on nearby residents before returning to the canopy to rest.',
+        paragraph2Sentences: [
+          'Ecological degradation around the reserves is playing a decisive role in driving this behavioral shift.',
+          'As deforestation fragments the surrounding landscape, the wild vertebrates that mosquitoes normally feed upon become scarce, forcing the insects to seek alternative hosts.',
+          'This adaptation is alarming because these vectors transmit severe pathogens, including dengue, Zika, malaria, and yellow fever.',
+          'Researchers emphasize that preserving intact forest buffers and maintaining ecological equilibrium is essential to prevent mosquitoes from permanently adapting to human blood.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that explains the laboratory method scientists used to determine which species the mosquitoes had bitten.',
+        correctHighlight1:
+          'When researchers captured engorged female mosquitoes inside protected nature reserves and sequenced the DNA of their blood meals, they discovered a striking preference for human hosts.',
+        highlightQuestion2:
+          'Click the sentence that explains why the loss of surrounding forest forces mosquitoes to change their feeding behavior.',
+        correctHighlight2:
+          'As deforestation fragments the surrounding landscape, the wild vertebrates that mosquitoes normally feed upon become scarce, forcing the insects to seek alternative hosts.',
+        mainIdeaOptions: [
+          'Deforestation and declining wildlife populations are driving forest mosquitoes to feed predominantly on humans, elevating the risk of vector-borne disease outbreaks.',
+          'Light traps placed one kilometer inside nature reserves are ineffective at capturing female mosquitoes.',
+          'DNA sequencing has eradicated yellow fever and dengue across Brazil’s Atlantic Forest.',
+          'Wild vertebrates in tropical reserves have developed natural immunity to mosquito bites.',
+        ],
+        correctMainIdea:
+          'Deforestation and declining wildlife populations are driving forest mosquitoes to feed predominantly on humans, elevating the risk of vector-borne disease outbreaks.',
+        titleOptions: [
+          'Driven by Deforestation: Why Forest Mosquitoes Are Developing a Taste for Human Blood',
+          'Advances in Light-Trap Engineering for Tropical Entomology',
+          'The Complete Eradication of Malaria in South American Cities',
+          'How Urbanization Increases Wildlife Populations in Nature Reserves',
+        ],
+        correctTitle:
+          'Driven by Deforestation: Why Forest Mosquitoes Are Developing a Taste for Human Blood',
+      },
+    },
+    {
+      id: 'ir-det-bilingual-cognition',
+      dayNumber: 13,
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'Cognitive Psychology & Linguistics',
+      prompt: 'Interactive Reading: Bilingualism and Executive Control Across the Lifespan',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'psychology', 'linguistics'],
+      interactiveReading: {
+        sourceName: 'Cognitive Psychology Review — Bilingualism',
+        paragraph1WithBlanks:
+          'Neuroimaging studies reveal that when a bilingual person speaks one language, the other language does not simply {{1}} dormant; instead, both linguistic systems remain simultaneously active in the brain. To prevent words from the non-target language from {{2}} into speech, the bilingual brain must constantly recruit the dorsolateral prefrontal cortex to manage attention. Over decades of daily communication, this continuous mental juggling {{3}} the brain’s executive control network, much like physical exercise strengthens {{4}} tissue.',
+        paragraph1Sentences: [
+          'Neuroimaging studies reveal that when a bilingual person speaks one language, the other language does not simply lie dormant; instead, both linguistic systems remain simultaneously active in the brain.',
+          'To prevent words from the non-target language from intruding into speech, the bilingual brain must constantly recruit the dorsolateral prefrontal cortex to manage attention.',
+          'Over decades of daily communication, this continuous mental juggling fortifies the brain’s executive control network, much like physical exercise strengthens muscular tissue.',
+        ],
+        blanks: [
+          { id: '1', options: ['lie', 'erupt', 'accelerate', 'concede'], correctAnswer: 'lie' },
+          { id: '2', options: ['intruding', 'vanishing', 'retreating', 'abstaining'], correctAnswer: 'intruding' },
+          { id: '3', options: ['fortifies', 'depletes', 'paralyzes', 'fragments'], correctAnswer: 'fortifies' },
+          { id: '4', options: ['muscular', 'synthetic', 'ceramic', 'auditory'], correctAnswer: 'muscular' },
+        ],
+        passageGapOptions: [
+          'The long-term benefits of this enhanced cognitive reserve become particularly evident during old age.',
+          'Consequently, monolingual speakers are unable to learn new vocabulary after the age of twenty.',
+          'In contrast, the prefrontal cortex is only active when individuals are sleeping.',
+          'Therefore, linguists recommend that schools teach only a single language in primary education.',
+        ],
+        correctPassageGap:
+          'The long-term benefits of this enhanced cognitive reserve become particularly evident during old age.',
+        paragraph2Sentences: [
+          'Clinical studies across multiple continents indicate that lifelong bilinguals manifest symptoms of age-related cognitive decline four to five years later than monolingual peers.',
+          'Importantly, post-mortem examinations show that bilingual brains still accumulate physical pathology, yet they compensate more effectively by routing signals through alternative neural pathways.',
+          'Learning a second language at any stage of adulthood provides measurable cognitive stimulation that supports healthy aging.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that explains why the prefrontal cortex must work continuously when a bilingual person speaks.',
+        correctHighlight1:
+          'To prevent words from the non-target language from intruding into speech, the bilingual brain must constantly recruit the dorsolateral prefrontal cortex to manage attention.',
+        highlightQuestion2:
+          'Click the sentence that explains how bilingual brains maintain function even when physical aging pathology is present.',
+        correctHighlight2:
+          'Importantly, post-mortem examinations show that bilingual brains still accumulate physical pathology, yet they compensate more effectively by routing signals through alternative neural pathways.',
+        mainIdeaOptions: [
+          'Managing two active languages strengthens executive control networks and builds cognitive reserve that delays symptoms of age-related decline.',
+          'Bilingual individuals never develop physical signs of aging in the brain.',
+          'The non-target language is completely switched off whenever a bilingual person speaks.',
+          'Second-language acquisition only benefits children under the age of five.',
+        ],
+        correctMainIdea:
+          'Managing two active languages strengthens executive control networks and builds cognitive reserve that delays symptoms of age-related decline.',
+        titleOptions: [
+          'The Bilingual Advantage: How Managing Two Languages Builds Lifelong Cognitive Reserve',
+          'Why Grammar Instruction Should Be Removed from Secondary Schools',
+          'A Anatomical Atlas of the Muscular System',
+          'How Monolingualism Accelerates Prefrontal Cortex Growth',
+        ],
+        correctTitle:
+          'The Bilingual Advantage: How Managing Two Languages Builds Lifelong Cognitive Reserve',
+      },
+    },
+    {
+      id: 'ir-bbc-heatwaves-brain',
+      dayNumber: 16,
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'BBC Science Focus (Public Health & Climate)',
+      prompt: 'Interactive Reading: Urban Cooling Infrastructure and Public Health',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'bbc', 'public-health', 'climate'],
+      interactiveReading: {
+        sourceName: 'BBC Science Focus — Public Health & Climate',
+        paragraph1WithBlanks:
+          'More frequent and intense heatwaves are not merely damaging ecosystems; they are directly {{1}} human cognitive function and neurological stability. Brain cells operate within a narrow optimal thermal window, and when ambient temperatures climb above that threshold, synaptic interactions become increasingly {{2}}. A neuron’s ability to fire relies on specialized proteins fitting into receptor sockets like a lock and key, but excessive heat causes these molecular keys to {{3}} their precise three-dimensional shape and {{4}} signal transmission.',
+        paragraph1Sentences: [
+          'More frequent and intense heatwaves are not merely damaging ecosystems; they are directly impairing human cognitive function and neurological stability.',
+          'Brain cells operate within a narrow optimal thermal window, and when ambient temperatures climb above that threshold, synaptic interactions become increasingly erratic.',
+          'A neuron’s ability to fire relies on specialized proteins fitting into receptor sockets like a lock and key, but excessive heat causes these molecular keys to lose their precise three-dimensional shape and misfire signal transmission.',
+        ],
+        blanks: [
+          { id: '1', options: ['impairing', 'enhancing', 'insulating', 'celebrating'], correctAnswer: 'impairing' },
+          { id: '2', options: ['erratic', 'infallible', 'dormant', 'effortless'], correctAnswer: 'erratic' },
+          { id: '3', options: ['lose', 'solidify', 'multiply', 'duplicate'], correctAnswer: 'lose' },
+          { id: '4', options: ['misfire', 'accelerate', 'purify', 'guarantee'], correctAnswer: 'misfire' },
+        ],
+        passageGapOptions: [
+          'Compound this cellular disruption with the fact that extreme heat also compromises the blood-brain barrier and disrupts restorative slow-wave sleep.',
+          'Consequently, neurons function with far greater speed and accuracy during severe summer droughts.',
+          'On the other hand, receptor sockets are made of inorganic minerals that never react to temperature.',
+          'For this reason, neuroscientists recommend eliminating shade trees from metropolitan neighborhoods.',
+        ],
+        correctPassageGap:
+          'Compound this cellular disruption with the fact that extreme heat also compromises the blood-brain barrier and disrupts restorative slow-wave sleep.',
+        paragraph2Sentences: [
+          'Epidemiological data reveals that hospital admissions for neurological and mood disorders spike measurably during prolonged periods of extreme heat.',
+          'Decision-making, impulse control, and working memory degrade first as the prefrontal cortex struggles to regulate internal thermal stress.',
+          'Urban planners and public health officials must therefore treat urban cooling infrastructure not just as an environmental amenity, but as a critical safeguard for population brain health.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that uses a mechanical analogy to explain how heat interferes with synaptic receptors.',
+        correctHighlight1:
+          'A neuron’s ability to fire relies on specialized proteins fitting into receptor sockets like a lock and key, but excessive heat causes these molecular keys to lose their precise three-dimensional shape and misfire signal transmission.',
+        highlightQuestion2:
+          'Click the sentence that specifies which cognitive faculties deteriorate earliest when the brain experiences thermal stress.',
+        correctHighlight2:
+          'Decision-making, impulse control, and working memory degrade first as the prefrontal cortex struggles to regulate internal thermal stress.',
+        mainIdeaOptions: [
+          'Extreme heatwaves deform neural proteins and impair prefrontal cortex function, making urban cooling essential for protecting cognitive and neurological health.',
+          'The human brain adapts effortlessly to extreme heat by expanding the blood-brain barrier.',
+          'Prefrontal cortex activity increases significantly during prolonged summer heatwaves.',
+          'Hospital admissions for neurological conditions decline when ambient temperatures exceed optimal thresholds.',
+        ],
+        correctMainIdea:
+          'Extreme heatwaves deform neural proteins and impair prefrontal cortex function, making urban cooling essential for protecting cognitive and neurological health.',
+        titleOptions: [
+          'The Overheated Mind: How Rising Temperatures Disrupt Neural Signaling',
+          'Why Synaptic Proteins Require High Temperatures to Replicate',
+          'The Architecture of Lock-and-Key Security Systems',
+          'How Slow-Wave Sleep Eliminates Urban Heat Islands',
+        ],
+        correctTitle:
+          'The Overheated Mind: How Rising Temperatures Disrupt Neural Signaling',
+      },
+    },
+    {
+      id: 'ir-det-roman-concrete',
+      dayNumber: 19,
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'Archaeology & Materials History',
+      prompt: 'Interactive Reading: Self-Healing Ancient Roman Concrete',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'history', 'architecture'],
+      interactiveReading: {
+        sourceName: 'Archaeological Science Today — Ancient Engineering',
+        paragraph1WithBlanks:
+          'While modern reinforced concrete structures often crumble within a {{1}} of decades, ancient Roman harbors and unreinforced domes like the Pantheon have {{2}} intact for two millennia. For generations, engineers attributed this extraordinary longevity solely to the inclusion of volcanic ash from Pozzuoli. However, high-resolution electron microscopy has recently {{3}} that tiny white mineral chunks embedded in Roman walls—long dismissed as sloppy mixing—are actually {{4}} to the material’s self-healing properties.',
+        paragraph1Sentences: [
+          'While modern reinforced concrete structures often crumble within a matter of decades, ancient Roman harbors and unreinforced domes like the Pantheon have endured intact for two millennia.',
+          'For generations, engineers attributed this extraordinary longevity solely to the inclusion of volcanic ash from Pozzuoli.',
+          'However, high-resolution electron microscopy has recently revealed that tiny white mineral chunks embedded in Roman walls—long dismissed as sloppy mixing—are actually central to the material’s self-healing properties.',
+        ],
+        blanks: [
+          { id: '1', options: ['matter', 'void', 'surplus', 'fraction'], correctAnswer: 'matter' },
+          { id: '2', options: ['endured', 'evaporated', 'succumbed', 'Wavered'], correctAnswer: 'endured' },
+          { id: '3', options: ['revealed', 'concealed', 'refuted', 'lamented'], correctAnswer: 'revealed' },
+          { id: '4', options: ['central', 'irrelevant', 'detrimental', 'hostile'], correctAnswer: 'central' },
+        ],
+        passageGapOptions: [
+          'These white inclusions, known as lime clasts, were formed when Roman builders mixed quicklime at extreme temperatures in a process called hot mixing.',
+          'Consequently, Roman emperors prohibited the construction of stone bridges across the Mediterranean.',
+          'By contrast, modern steel rebar never corrodes when exposed to coastal saltwater.',
+          'Therefore, volcanic ash is no longer studied by geological researchers in Italy.',
+        ],
+        correctPassageGap:
+          'These white inclusions, known as lime clasts, were formed when Roman builders mixed quicklime at extreme temperatures in a process called hot mixing.',
+        paragraph2Sentences: [
+          'Whenever microscopic cracks form inside the concrete over time, rainwater seeps in and dissolves the calcium-rich lime clasts.',
+          'This saturated calcium solution then recrystallizes inside the fissure, automatically sealing the crack before it can widen.',
+          'Adopting this ancient Roman formulation in modern civil engineering could dramatically extend bridge lifespans and slash the global carbon footprint of cement manufacturing.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that states what scholars previously believed caused the durability of Roman concrete.',
+        correctHighlight1:
+          'For generations, engineers attributed this extraordinary longevity solely to the inclusion of volcanic ash from Pozzuoli.',
+        highlightQuestion2:
+          'Click the sentence that explains the chemical mechanism by which rainwater repairs cracks in Roman walls.',
+        correctHighlight2:
+          'This saturated calcium solution then recrystallizes inside the fissure, automatically sealing the crack before it can widen.',
+        mainIdeaOptions: [
+          'Hot-mixed lime clasts give ancient Roman concrete a self-healing capability that could make modern infrastructure more durable and sustainable.',
+          'Roman concrete failed frequently because workers did not mix the quicklime thoroughly.',
+          'Modern steel-reinforced concrete lasts significantly longer than ancient Roman masonry.',
+          'Rainwater rapidly destroys any concrete structure containing calcium carbonate.',
+        ],
+        correctMainIdea:
+          'Hot-mixed lime clasts give ancient Roman concrete a self-healing capability that could make modern infrastructure more durable and sustainable.',
+        titleOptions: [
+          'Built for Eternity: The Self-Healing Chemistry Behind Ancient Roman Concrete',
+          'Why the Pantheon Collapsed During the Middle Ages',
+          'A History of Steel Manufacturing in Twentieth-Century Bridges',
+          'The Environmental Dangers of Volcanic Ash in Southern Italy',
+        ],
+        correctTitle:
+          'Built for Eternity: The Self-Healing Chemistry Behind Ancient Roman Concrete',
+      },
+    },
+
+    // =====================================================================
+    // PART B: 14 READ AND COMPLETE PASSAGES (1-Letter-Per-Box Cloze)
+    // =====================================================================
+    {
+      id: 'rc-det-urban-canopy',
+      dayNumber: 1,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'Urban Forestry & Public Health',
+      prompt: 'Read and Complete: Urban Tree Canopies and Neighborhood Cooling',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'environment', 'urban-planning'],
+      readAndComplete: {
+        sourceName: 'Urban Forestry & Civic Design',
+        title: 'Mitigating Urban Heat Islands Through Tree Canopies',
+        passageWithBlanks:
+          'Dense metropolitan neighborhoods dominated by asphalt and dark roofing {{1}} absorb solar energy and radiate intense heat well into the {{2}}. Expanding municipal tree canopies along residential {{3}} provides natural shade while cooling the surrounding air through leaf {{4}}. Public health studies confirm that neighborhoods with mature tree cover experience {{5}} fewer heat-related emergency hospital {{6}} during summer months.',
+        blanks: [
+          { id: '1', prefix: 'mat', missingSuffix: 'erials', fullWord: 'materials' },
+          { id: '2', prefix: 'ev', missingSuffix: 'ening', fullWord: 'evening' },
+          { id: '3', prefix: 'str', missingSuffix: 'eets', fullWord: 'streets' },
+          { id: '4', prefix: 'trans', missingSuffix: 'piration', fullWord: 'transpiration' },
+          { id: '5', prefix: 'sign', missingSuffix: 'ificantly', fullWord: 'significantly' },
+          { id: '6', prefix: 'adm', missingSuffix: 'issions', fullWord: 'admissions' },
+        ],
+      },
+    },
+    {
+      id: 'rc-bbc-mycorrhizal-networks',
+      dayNumber: 2,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Forest Ecology)',
+      prompt: 'Read and Complete: Mycorrhizal Networks and Subterranean Resource Sharing',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'ecology'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Forest Ecology',
+        title: 'Subterranean Mycorrhizal Networks',
+        passageWithBlanks:
+          'Subterranean fungal networks connect temperate forest root systems into an expansive resource-sharing {{1}}. When mature trees absorb sunlight, they allocate excess carbon {{2}} across these mycorrhizal pathways to nourish younger {{3}} shaded beneath the canopy. Ecologists now recognize that treating trees as isolated competitors ignores the cooperative {{4}} that sustains old-growth forest {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'net', missingSuffix: 'work', fullWord: 'network' },
+          { id: '2', prefix: 'prod', missingSuffix: 'ucts', fullWord: 'products' },
+          { id: '3', prefix: 'see', missingSuffix: 'dlings', fullWord: 'seedlings' },
+          { id: '4', prefix: 'dyn', missingSuffix: 'amics', fullWord: 'dynamics' },
+          { id: '5', prefix: 'res', missingSuffix: 'ilience', fullWord: 'resilience' },
+        ],
+      },
+    },
+    {
+      id: 'rc-bbc-forensic-linguistics',
+      dayNumber: 3,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Linguistics & Psychology)',
+      prompt: 'Read and Complete: Detecting Deception Through Verbal Language Patterns',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'psychology'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Linguistics',
+        title: 'Verbal Clues to Deception',
+        passageWithBlanks:
+          'Contrary to popular belief, body language is an unreliable {{1}} of deception, whereas verbal language contains measurable {{2}} clues. Forensic linguists have demonstrated that individuals fabricating a story often use fewer first-person {{3}} to distance themselves psychologically from their {{4}}. Furthermore, the cognitive load of maintaining a false {{5}} frequently reduces syntactic {{6}} and sensory detail.',
+        blanks: [
+          { id: '1', prefix: 'ind', missingSuffix: 'icator', fullWord: 'indicator' },
+          { id: '2', prefix: 'ling', missingSuffix: 'uistic', fullWord: 'linguistic' },
+          { id: '3', prefix: 'pron', missingSuffix: 'ouns', fullWord: 'pronouns' },
+          { id: '4', prefix: 'stat', missingSuffix: 'ements', fullWord: 'statements' },
+          { id: '5', prefix: 'narr', missingSuffix: 'ative', fullWord: 'narrative' },
+          { id: '6', prefix: 'comp', missingSuffix: 'lexity', fullWord: 'complexity' },
+        ],
+      },
+    },
+    {
+      id: 'rc-det-gutenberg-printing',
+      dayNumber: 5,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'European History & Media Studies',
+      prompt: 'Read and Complete: Movable Type and the Democratization of Literacy',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'history', 'education'],
+      readAndComplete: {
+        sourceName: 'Historical Media Review — The Printing Press',
+        title: 'Movable Type and Renaissance Literacy',
+        passageWithBlanks:
+          'Prior to the invention of mechanical movable type in the fifteenth {{1}}, books in Europe were painstakingly copied by hand in monastic {{2}}. Because a single illuminated manuscript required months of skilled {{3}}, written knowledge remained the exclusive privilege of wealthy {{4}}. The rapid proliferation of printing presses drastically reduced book {{5}}, fueling vernacular literacy and accelerating scientific {{6}} across the continent.',
+        blanks: [
+          { id: '1', prefix: 'cen', missingSuffix: 'tury', fullWord: 'century' },
+          { id: '2', prefix: 'scr', missingSuffix: 'iptoria', fullWord: 'scriptoria' },
+          { id: '3', prefix: 'la', missingSuffix: 'bor', fullWord: 'labor' },
+          { id: '4', prefix: 'el', missingSuffix: 'ites', fullWord: 'elites' },
+          { id: '5', prefix: 'pr', missingSuffix: 'ices', fullWord: 'prices' },
+          { id: '6', prefix: 'in', missingSuffix: 'quiry', fullWord: 'inquiry' },
+        ],
+      },
+    },
+    {
+      id: 'rc-bbc-circadian-clocks',
+      dayNumber: 6,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Chronobiology & Health)',
+      prompt: 'Read and Complete: Circadian Rhythms and Evening Light Exposure',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'health'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Chronobiology',
+        title: 'Circadian Desynchronization and Metabolic Health',
+        passageWithBlanks:
+          'The human central circadian clock inside the suprachiasmatic nucleus coordinates hormonal secretion with solar {{1}}. Exposure to high-intensity blue light late at night suppresses pineal melatonin {{2}}, misaligning central neural rhythms with peripheral metabolic {{3}} in the liver and gut. Chronic circadian disruption impairs insulin {{4}} and significantly elevates long-term risks of cardiovascular {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'cy', missingSuffix: 'cles', fullWord: 'cycles' },
+          { id: '2', prefix: 'syn', missingSuffix: 'thesis', fullWord: 'synthesis' },
+          { id: '3', prefix: 'cl', missingSuffix: 'ocks', fullWord: 'clocks' },
+          { id: '4', prefix: 'sen', missingSuffix: 'sitivity', fullWord: 'sensitivity' },
+          { id: '5', prefix: 'dis', missingSuffix: 'orders', fullWord: 'disorders' },
+        ],
+      },
+    },
+    {
+      id: 'rc-det-coral-bleaching',
+      dayNumber: 8,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'Marine Biology & Conservation',
+      prompt: 'Read and Complete: Symbiotic Algae and Coral Reef Resilience',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'marine', 'ecology'],
+      readAndComplete: {
+        sourceName: 'Marine Conservation Quarterly',
+        title: 'Thermal Stress and Coral Symbiosis',
+        passageWithBlanks:
+          'Reef-building corals depend on a mutually beneficial {{1}} with microscopic algae living inside their tissues. These photosynthetic algae supply the coral polyps with essential {{2}} while imparting vibrant colors to the reef {{3}}. When ocean temperatures rise even slightly above seasonal {{4}}, stressed corals expel their algal partners, leaving behind ghostly white calcium {{5}} vulnerable to starvation and {{6}}.',
+        blanks: [
+          { id: '1', prefix: 'rel', missingSuffix: 'ationship', fullWord: 'relationship' },
+          { id: '2', prefix: 'nut', missingSuffix: 'rients', fullWord: 'nutrients' },
+          { id: '3', prefix: 'str', missingSuffix: 'ucture', fullWord: 'structure' },
+          { id: '4', prefix: 'av', missingSuffix: 'erages', fullWord: 'averages' },
+          { id: '5', prefix: 'ske', missingSuffix: 'letons', fullWord: 'skeletons' },
+          { id: '6', prefix: 'dis', missingSuffix: 'ease', fullWord: 'disease' },
+        ],
+      },
+    },
+    {
+      id: 'rc-det-public-libraries',
+      dayNumber: 9,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'Sociology & Civic Institutions',
+      prompt: 'Read and Complete: The Evolving Role of Municipal Libraries',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'sociology', 'education'],
+      readAndComplete: {
+        sourceName: 'Civic Sociology Review — Public Spaces',
+        title: 'Municipal Libraries as Social Infrastructure',
+        passageWithBlanks:
+          'Far from becoming obsolete in the digital era, municipal public libraries have evolved into vital community {{1}}. Beyond lending printed books, modern branches provide free broadband {{2}}, career counseling workshops, and quiet study {{3}} for students lacking space at home. Sociologists emphasize that libraries represent one of the few remaining indoor {{4}} where citizens can gather without any commercial {{5}} to spend {{6}}.',
+        blanks: [
+          { id: '1', prefix: 'hu', missingSuffix: 'bs', fullWord: 'hubs' },
+          { id: '2', prefix: 'ac', missingSuffix: 'cess', fullWord: 'access' },
+          { id: '3', prefix: 'env', missingSuffix: 'ironments', fullWord: 'environments' },
+          { id: '4', prefix: 'sp', missingSuffix: 'aces', fullWord: 'spaces' },
+          { id: '5', prefix: 'obl', missingSuffix: 'igation', fullWord: 'obligation' },
+          { id: '6', prefix: 'mo', missingSuffix: 'ney', fullWord: 'money' },
+        ],
+      },
+    },
+    {
+      id: 'rc-bbc-permafrost-thaw',
+      dayNumber: 11,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Climatology)',
+      prompt: 'Read and Complete: Thermokarst Methane Feedback in Arctic Permafrost',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'climate'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Climatology',
+        title: 'Arctic Permafrost Thaw and Methane Release',
+        passageWithBlanks:
+          'Accelerated Arctic warming is rapidly degrading subterranean permafrost across high-latitude tundra {{1}}. As frozen organic soils thaw, anaerobic microbes decompose centuries-old plant {{2}}, releasing massive volumes of potent methane gas into thermokarst {{3}}. Climatologists warn this process threatens to trigger an irreversible positive {{4}} loop in the global climate {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'reg', missingSuffix: 'ions', fullWord: 'regions' },
+          { id: '2', prefix: 'mat', missingSuffix: 'ter', fullWord: 'matter' },
+          { id: '3', prefix: 'la', missingSuffix: 'kes', fullWord: 'lakes' },
+          { id: '4', prefix: 'feed', missingSuffix: 'back', fullWord: 'feedback' },
+          { id: '5', prefix: 'sys', missingSuffix: 'tem', fullWord: 'system' },
+        ],
+      },
+    },
+    {
+      id: 'rc-det-honeybee-waggle',
+      dayNumber: 12,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'Animal Behavior & Zoology',
+      prompt: 'Read and Complete: Symbolic Communication in Honeybee Foraging',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'biology', 'nature'],
+      readAndComplete: {
+        sourceName: 'Journal of Animal Behavior — Apiculture',
+        title: 'The Honeybee Waggle Dance',
+        passageWithBlanks:
+          'When a scout honeybee discovers a productive patch of blooming wildflowers, she returns to the hive to {{1}} the exact location to her nestmates. By performing a figure-eight waggle {{2}} on the vertical honeycomb, the scout encodes both the distance and {{3}} of the food source relative to the sun. Recent experiments demonstrate that young bees refine their dancing {{4}} by observing experienced {{5}} before flying out alone.',
+        blanks: [
+          { id: '1', prefix: 'comm', missingSuffix: 'unicate', fullWord: 'communicate' },
+          { id: '2', prefix: 'da', missingSuffix: 'nce', fullWord: 'dance' },
+          { id: '3', prefix: 'dir', missingSuffix: 'ection', fullWord: 'direction' },
+          { id: '4', prefix: 'acc', missingSuffix: 'uracy', fullWord: 'accuracy' },
+          { id: '5', prefix: 'for', missingSuffix: 'agers', fullWord: 'foragers' },
+        ],
+      },
+    },
+    {
+      id: 'rc-conversation-deep-sea-nodules',
+      dayNumber: 14,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'The Conversation (Marine Conservation)',
+      prompt: 'Read and Complete: Polymetallic Nodules and Abyssal Ecosystems',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'the-conversation', 'marine'],
+      readAndComplete: {
+        sourceName: 'The Conversation — Marine Geochemistry',
+        title: 'Deep-Sea Mining and Abyssal Plain Ecology',
+        passageWithBlanks:
+          'Mining companies seeking battery metals are targeting polymetallic nodules resting on the abyssal {{1}} of the Pacific Ocean. However, marine biologists warn that vacuuming these ancient mineral deposits would obliterate fragile benthic {{2}} that require millennia to recover. Because deep-ocean currents are exceptionally {{3}}, suspended sediment plumes could drift for hundreds of miles, suffocating filter-feeding {{4}} throughout the water {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'pl', missingSuffix: 'ain', fullWord: 'plain' },
+          { id: '2', prefix: 'hab', missingSuffix: 'itats', fullWord: 'habitats' },
+          { id: '3', prefix: 'sl', missingSuffix: 'uggish', fullWord: 'sluggish' },
+          { id: '4', prefix: 'org', missingSuffix: 'anisms', fullWord: 'organisms' },
+          { id: '5', prefix: 'col', missingSuffix: 'umn', fullWord: 'column' },
+        ],
+      },
+    },
+    {
+      id: 'rc-det-crop-rotation',
+      dayNumber: 15,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'Agronomy & Sustainable Farming',
+      prompt: 'Read and Complete: Legume Cover Crops and Soil Nitrogen Fixation',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'agriculture', 'environment'],
+      readAndComplete: {
+        sourceName: 'Sustainable Agronomy Review',
+        title: 'Biological Nitrogen Fixation in Crop Rotation',
+        passageWithBlanks:
+          'Planting the same cereal crop in the same field year after year rapidly {{1}} essential soil nutrients and encourages agricultural pests. By alternating grain harvests with leguminous cover {{2}} such as clover or lentils, farmers naturally replenish soil {{3}} without relying on synthetic fertilizers. Symbiotic bacteria residing in legume root {{4}} convert atmospheric nitrogen into soluble compounds that nourish subsequent {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'dep', missingSuffix: 'letes', fullWord: 'depletes' },
+          { id: '2', prefix: 'cr', missingSuffix: 'ops', fullWord: 'crops' },
+          { id: '3', prefix: 'fer', missingSuffix: 'tility', fullWord: 'fertility' },
+          { id: '4', prefix: 'nod', missingSuffix: 'ules', fullWord: 'nodules' },
+          { id: '5', prefix: 'har', missingSuffix: 'vests', fullWord: 'harvests' },
+        ],
+      },
+    },
+    {
+      id: 'rc-bbc-acoustic-alzheimers',
+      dayNumber: 17,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Health & Aging)',
+      prompt: 'Read and Complete: Acoustic Stimulation and Restorative Sleep Waves',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'health'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Neurology',
+        title: 'Acoustic Stimulation and Neural Waste Clearance',
+        passageWithBlanks:
+          'Non-invasive sound stimulation may help resynchronize brain {{1}} and restore the timing signals that instruct neural cleaning {{2}} when and where to clear metabolic waste. In a recent clinical trial, subjects exposed to calibrated acoustic tones for one {{3}} daily exhibited a substantial {{4}} in waste clearance within their cerebrospinal {{5}}. Remarkably, these beneficial effects {{6}} for five weeks after the trial concluded, offering a {{7}} clue for healthy aging.',
+        blanks: [
+          { id: '1', prefix: 'act', missingSuffix: 'ivity', fullWord: 'activity' },
+          { id: '2', prefix: 'sys', missingSuffix: 'tems', fullWord: 'systems' },
+          { id: '3', prefix: 'ho', missingSuffix: 'ur', fullWord: 'hour' },
+          { id: '4', prefix: 'inc', missingSuffix: 'rease', fullWord: 'increase' },
+          { id: '5', prefix: 'fl', missingSuffix: 'uid', fullWord: 'fluid' },
+          { id: '6', prefix: 'pers', missingSuffix: 'isted', fullWord: 'persisted' },
+          { id: '7', prefix: 'prom', missingSuffix: 'ising', fullWord: 'promising' },
+        ],
+      },
+    },
+    {
+      id: 'rc-det-museum-repatriation',
+      dayNumber: 18,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'Museum Studies & Cultural Policy',
+      prompt: 'Read and Complete: Provenance Research and Cultural Artifacts',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'culture', 'history'],
+      readAndComplete: {
+        sourceName: 'International Cultural Heritage Journal',
+        title: 'Provenance Research in National Museums',
+        passageWithBlanks:
+          'Major encyclopedic museums are increasingly conducting rigorous provenance {{1}} to trace the ownership history of antiquities in their permanent {{2}}. When archival documents reveal that an artifact was acquired through colonial {{3}} or illicit excavation, curators collaborate with countries of {{4}} to arrange formal repatriation. Simultaneously, high-resolution 3D {{5}} allows institutions to retain accurate educational replicas for public {{6}}.',
+        blanks: [
+          { id: '1', prefix: 'res', missingSuffix: 'earch', fullWord: 'research' },
+          { id: '2', prefix: 'coll', missingSuffix: 'ections', fullWord: 'collections' },
+          { id: '3', prefix: 'plu', missingSuffix: 'nder', fullWord: 'plunder' },
+          { id: '4', prefix: 'or', missingSuffix: 'igin', fullWord: 'origin' },
+          { id: '5', prefix: 'sca', missingSuffix: 'nning', fullWord: 'scanning' },
+          { id: '6', prefix: 'exh', missingSuffix: 'ibition', fullWord: 'exhibition' },
+        ],
+      },
+    },
+    {
+      id: 'rc-det-geothermal-heating',
+      dayNumber: 20,
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'Renewable Energy & Civil Engineering',
+      prompt: 'Read and Complete: District Geothermal Heating in Northern Cities',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'energy', 'environment'],
+      readAndComplete: {
+        sourceName: 'Clean Energy Infrastructure Review',
+        title: 'Geothermal District Heating Networks',
+        passageWithBlanks:
+          'Unlike solar panels and wind turbines, which fluctuate with daily weather {{1}}, geothermal energy provides a continuous baseload heat {{2}} twenty-four hours a day. By circulating water through deep subterranean rock {{3}}, municipal district heating networks warm thousands of residential {{4}} during freezing winters. Once the underground pipe infrastructure is {{5}}, operational maintenance costs remain remarkably {{6}} for decades.',
+        blanks: [
+          { id: '1', prefix: 'cond', missingSuffix: 'itions', fullWord: 'conditions' },
+          { id: '2', prefix: 'su', missingSuffix: 'pply', fullWord: 'supply' },
+          { id: '3', prefix: 'form', missingSuffix: 'ations', fullWord: 'formations' },
+          { id: '4', prefix: 'buil', missingSuffix: 'dings', fullWord: 'buildings' },
+          { id: '5', prefix: 'inst', missingSuffix: 'alled', fullWord: 'installed' },
+          { id: '6', prefix: 'st', missingSuffix: 'able', fullWord: 'stable' },
+        ],
+      },
+    },
+
+    // =====================================================================
+    // PART C: 15 COLLOCATION CHUNK WRITING PROMPTS (Distinct DET Sets!)
+    // =====================================================================
+    {
+      id: 'vw-det-public-transit',
+      dayNumber: 1,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Urban Mobility',
+      prompt: 'Write an academic paragraph arguing why cities should prioritize public transit over highway expansion, incorporating all 4 collocation chunks below.',
+      targetChunks: [
+        'allocate public funds to',
+        'alleviate traffic congestion',
+        'viable alternative to',
+        'long-term socioeconomic benefits',
+      ],
+      sampleAnswer:
+        'Municipal governments should allocate public funds to electrified rail and bus corridors rather than highway widening, as reliable mass transit offers a viable alternative to private vehicles, helps alleviate traffic congestion, and delivers long-term socioeconomic benefits for working commuters.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'urban-planning'],
+    },
+    {
+      id: 'vw-det-arts-education',
+      dayNumber: 2,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Education & Arts',
+      prompt: 'Write an analytical paragraph on the importance of preserving music and fine arts in secondary school curricula using all 4 collocation chunks below.',
+      targetChunks: [
+        'foster creative thinking',
+        'holistic intellectual development',
+        'at the expense of',
+        'cultivate empathy and cultural appreciation',
+      ],
+      sampleAnswer:
+        'When school boards emphasize standardized test preparation at the expense of fine arts programs, they undermine holistic intellectual development; music and theater instruction not only foster creative thinking but also cultivate empathy and cultural appreciation among diverse student bodies.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'education', 'arts'],
+    },
+    {
+      id: 'vw-det-environmental-tax',
+      dayNumber: 3,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Sustainability',
+      prompt: 'Write an academic paragraph evaluating how governments can reduce single-use plastic waste using all 4 collocation chunks below.',
+      targetChunks: [
+        'pose a severe threat to',
+        'incentivize sustainable practices',
+        'hold manufacturers accountable',
+        'transition toward a circular economy',
+      ],
+      sampleAnswer:
+        'Because non-biodegradable packaging continues to pose a severe threat to marine ecosystems, lawmakers must hold manufacturers accountable through extended producer responsibility laws that incentivize sustainable practices and accelerate the transition toward a circular economy.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'environment'],
+    },
+    {
+      id: 'vw-det-historic-preservation',
+      dayNumber: 4,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Architecture & Heritage',
+      prompt: 'Write a C1/C2 paragraph discussing how rapidly growing cities should balance modern housing needs with preserving historic architecture.',
+      targetChunks: [
+        'strike a delicate balance between',
+        'preserve cultural heritage',
+        'adaptive reuse of historic structures',
+        'sense of civic identity',
+      ],
+      sampleAnswer:
+        'Urban planners must strike a delicate balance between high-density housing construction and efforts to preserve cultural heritage; encouraging the adaptive reuse of historic structures allows municipalities to modernize urban amenities while safeguarding the neighborhood’s sense of civic identity.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'architecture'],
+    },
+    {
+      id: 'vw-det-remote-work-balance',
+      dayNumber: 5,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Workplace Sociology',
+      prompt: 'Write an analytical paragraph examining the impact of hybrid and remote work arrangements on employee well-being and team cohesion.',
+      targetChunks: [
+        'blur the boundaries between',
+        'spontaneous collaborative exchange',
+        'greater autonomy over',
+        'mitigate professional burnout',
+      ],
+      sampleAnswer:
+        'Although flexible telecommuting grants employees greater autonomy over their daily schedules and helps mitigate professional burnout, unstructured remote arrangements can blur the boundaries between domestic life and work while diminishing opportunities for spontaneous collaborative exchange.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'workplace'],
+    },
+    {
+      id: 'vw-det-public-health-nutrition',
+      dayNumber: 6,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Public Health',
+      prompt: 'Write an academic paragraph on whether governments should subsidize fresh produce and regulate ultra-processed food marketing.',
+      targetChunks: [
+        'curb the rising prevalence of',
+        'preventative healthcare measures',
+        'disproportionately affect low-income households',
+        'make informed dietary choices',
+      ],
+      sampleAnswer:
+        'To curb the rising prevalence of chronic metabolic illnesses, public health ministries should invest in preventative healthcare measures and clear nutritional labeling, empowering citizens to make informed dietary choices while subsidizing fresh produce that would otherwise disproportionately affect low-income households.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'health'],
+    },
+    {
+      id: 'vw-det-sustainable-tourism',
+      dayNumber: 7,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Global Tourism',
+      prompt: 'Write a dense academic paragraph evaluating the effects of mass tourism on fragile historical towns and natural parks.',
+      targetChunks: [
+        'generate vital revenue for',
+        'place immense strain on',
+        'enforce strict visitor quotas',
+        'preserve ecological integrity',
+      ],
+      sampleAnswer:
+        'While international visitors generate vital revenue for hospitality sectors, unchecked mass tourism can place immense strain on municipal waste systems and fragile habitats, compelling authorities to enforce strict visitor quotas to preserve ecological integrity.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'tourism'],
+    },
+    {
+      id: 'vw-det-lifelong-learning',
+      dayNumber: 8,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Adult Education',
+      prompt: 'Write an academic paragraph explaining why universities and employers should support continuous adult education and vocational retraining.',
+      targetChunks: [
+        'adapt to rapidly evolving',
+        'equip workers with transferable skills',
+        'bridge the gap between',
+        'foster upward social mobility',
+      ],
+      sampleAnswer:
+        'Accessible adult education programs equip workers with transferable skills that allow them to adapt to rapidly evolving economic sectors, helping to bridge the gap between academic theory and industry demands while continuing to foster upward social mobility.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'education'],
+    },
+    {
+      id: 'vw-det-media-literacy',
+      dayNumber: 9,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Journalism & Society',
+      prompt: 'Write a C1/C2 paragraph on the role of critical media literacy in modern secondary education.',
+      targetChunks: [
+        'evaluate the credibility of',
+        'susceptible to sensationalism',
+        'cross-reference multiple primary sources',
+        'cornerstone of an informed citizenry',
+      ],
+      sampleAnswer:
+        'In an era where online readers are increasingly susceptible to sensationalism, teaching adolescents to evaluate the credibility of news outlets and cross-reference multiple primary sources remains the cornerstone of an informed citizenry.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'media'],
+    },
+    {
+      id: 'vw-det-urban-green-spaces',
+      dayNumber: 10,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Civic Design',
+      prompt: 'Write an analytical paragraph on the psychological and social value of neighborhood parks and botanical gardens.',
+      targetChunks: [
+        'serve as a vital refuge from',
+        'strengthen community social cohesion',
+        'measurable reductions in',
+        'equitable access to green space',
+      ],
+      sampleAnswer:
+        'Well-maintained municipal parks serve as a vital refuge from urban noise and concrete density, producing measurable reductions in psychological stress while helping to strengthen community social cohesion when cities guarantee equitable access to green space.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'urban-planning'],
+    },
+    {
+      id: 'vw-det-renewable-grid',
+      dayNumber: 11,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Clean Energy',
+      prompt: 'Write an academic paragraph discussing the challenges and benefits of transitioning national power grids to wind and solar energy.',
+      targetChunks: [
+        'reduce dependence on fossil fuels',
+        'intermittent nature of',
+        'invest in grid-scale energy storage',
+        'accelerate the clean energy transition',
+      ],
+      sampleAnswer:
+        'To reduce dependence on fossil fuels and accelerate the clean energy transition, public utilities must invest in grid-scale energy storage capable of compensating for the intermittent nature of wind and solar generation.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'energy'],
+    },
+    {
+      id: 'vw-det-experiential-learning',
+      dayNumber: 13,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Pedagogy',
+      prompt: 'Write an academic paragraph comparing hands-on experiential learning (internships, laboratory work) with traditional lecture-based instruction.',
+      targetChunks: [
+        'passive absorption of information',
+        'translate theoretical knowledge into',
+        'cultivate problem-solving resilience',
+        'deepen conceptual understanding',
+      ],
+      sampleAnswer:
+        'Whereas lecture halls often encourage the passive absorption of information, structured internships and laboratory projects compel students to translate theoretical knowledge into practical solutions, thereby helping to deepen conceptual understanding and cultivate problem-solving resilience.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'education'],
+    },
+    {
+      id: 'vw-det-water-conservation',
+      dayNumber: 15,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Resource Management',
+      prompt: 'Write an analytical paragraph on how arid regions can safeguard freshwater supplies for agriculture and households.',
+      targetChunks: [
+        'chronic water scarcity',
+        'modernize agricultural irrigation',
+        'mitigate the effects of drought',
+        'sustainable resource management',
+      ],
+      sampleAnswer:
+        'Regions confronting chronic water scarcity must modernize agricultural irrigation through drip-delivery systems and greywater recycling, ensuring sustainable resource management that can effectively mitigate the effects of drought.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'environment'],
+    },
+    {
+      id: 'vw-det-local-commerce',
+      dayNumber: 17,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Local Economics',
+      prompt: 'Write an academic paragraph analyzing the importance of independent local bookstores and artisan markets in the age of e-commerce.',
+      targetChunks: [
+        'sheer convenience of online retail',
+        'anchor neighborhood commercial districts',
+        'foster face-to-face community ties',
+        'preserve local economic vitality',
+      ],
+      sampleAnswer:
+        'Despite the sheer convenience of online retail, independent shops and farmers markets anchor neighborhood commercial districts, foster face-to-face community ties, and circulate revenue locally to preserve local economic vitality.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'economics'],
+    },
+    {
+      id: 'vw-det-scientific-collaboration',
+      dayNumber: 20,
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank — Global Research',
+      prompt: 'Write a C1/C2 paragraph explaining why international cooperation is essential for solving global public health and environmental challenges.',
+      targetChunks: [
+        'transcend national borders',
+        'pool financial and intellectual resources',
+        'open exchange of empirical data',
+        'accelerate scientific breakthroughs',
+      ],
+      sampleAnswer:
+        'Because pandemics and climate shifts transcend national borders, research institutions must pool financial and intellectual resources and commit to the open exchange of empirical data in order to accelerate scientific breakthroughs.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'science'],
+    },
+
+    // =====================================================================
+    // PART D: 10 INTERACTIVE WRITING PROMPTS (General DET Essay Topics)
+    // =====================================================================
+    {
+      id: 'iw-det-university-community-service',
+      dayNumber: 2,
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Official-Style Writing Bank — Education',
+      prompt: 'Some universities require every undergraduate student to complete at least 60 hours of unpaid community service in order to graduate. Evaluate the benefits and potential drawbacks of mandatory volunteer programs for university students.',
+      sampleAnswer:
+        'Mandatory civic engagement exposes students to real-world municipal challenges and fosters social responsibility; however, rigid unpaid hour requirements can place an unfair financial burden on working students who must balance tuition expenses with part-time employment.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'education', 'society'],
+    },
+    {
+      id: 'iw-det-car-free-city-centers',
+      dayNumber: 5,
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Official-Style Writing Bank — Urban Policy',
+      prompt: 'Many metropolitan governments are converting downtown commercial streets into pedestrian-only zones by banning private cars. Discuss how car-free city centers affect local retail businesses, residents, and daily commuters.',
+      sampleAnswer:
+        'Although shopkeepers initially fear that removing street parking will deter motorists, empirical urban studies consistently show that pedestrianized boulevards increase foot traffic, reduce air pollution, and boost café and retail sales, provided that accessible public transit surrounds the zone.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'urban-planning'],
+    },
+    {
+      id: 'iw-det-standardized-assessments',
+      dayNumber: 8,
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Official-Style Writing Bank — Pedagogy',
+      prompt: 'Secondary schools often rely on high-stakes annual standardized exams to measure student achievement and school quality. Argue whether continuous portfolio-based assessment is a superior alternative to single-day standardized testing.',
+      sampleAnswer:
+        'While standardized examinations offer an objective benchmark across diverse school districts, they frequently narrow classroom instruction to rote test-taking drills, whereas longitudinal project portfolios evaluate research depth, revision resilience, and collaborative problem-solving.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'education'],
+    },
+    {
+      id: 'iw-det-museum-admission-fees',
+      dayNumber: 11,
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Official-Style Writing Bank — Cultural Policy',
+      prompt: 'Should national museums and historical art galleries be fully funded by taxpayers so admission is free for all visitors, or should they charge entry fees to cover maintenance and exhibition costs?',
+      sampleAnswer:
+        'Eliminating admission fees democratizes access to cultural heritage regardless of socioeconomic status; nevertheless, a hybrid model that guarantees free entry for domestic students and residents while charging a modest fee for international tourists can sustainably fund conservation.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'arts', 'policy'],
+    },
+    {
+      id: 'iw-det-four-day-workweek',
+      dayNumber: 14,
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Official-Style Writing Bank — Economics',
+      prompt: 'Several organizations have trialed a compressed four-day workweek (32 hours at full pay). Analyze whether a four-day workweek is feasible across different industries and how it impacts productivity and work-life balance.',
+      sampleAnswer:
+        'In knowledge-intensive sectors, reducing working hours frequently eliminates unproductive meetings and sharpens cognitive focus; however, customer-facing healthcare, hospitality, and manufacturing industries require staggered shift coverage that complicates a universal four-day schedule.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'workplace', 'economics'],
+    },
+    {
+      id: 'iw-det-packaging-taxes',
+      dayNumber: 16,
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Official-Style Writing Bank — Environment',
+      prompt: 'To reduce household waste, some economists propose taxing consumers for every non-recyclable item they purchase, while others argue that regulations should target corporate manufacturers directly. Which approach is more effective and equitable?',
+      sampleAnswer:
+        'Levying point-of-sale taxes on consumers often acts as a regressive burden when affordable eco-friendly alternatives are unavailable in local supermarkets; regulating industrial packaging standards upstream forces corporations to redesign containers before products ever reach the shelf.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'environment', 'policy'],
+    },
+    {
+      id: 'iw-det-gap-year-before-university',
+      dayNumber: 18,
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Official-Style Writing Bank — Youth & Education',
+      prompt: 'Taking a structured gap year to work, volunteer, or travel between high school and university has become increasingly common. Evaluate the advantages and potential risks of delaying university enrollment by one year.',
+      sampleAnswer:
+        'A purposeful gap year cultivates financial maturity and clarifies academic goals so students enter university with stronger intrinsic motivation, though unstructured time off risks eroding study habits and delaying entry into long-term professional careers.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'education'],
+    },
+    {
+      id: 'iw-det-cashless-society',
+      dayNumber: 21,
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Official-Style Writing Bank — Economics & Society',
+      prompt: 'Many retail businesses and public transit systems now accept only digital or card payments, refusing physical cash. Discuss the societal advantages and drawbacks of transitioning to a completely cashless economy.',
+      sampleAnswer:
+        'Digital transactions accelerate checkout efficiency and curb tax evasion, yet a purely cashless economy marginalizes unbanked citizens and elderly residents while leaving commercial activity vulnerable to power outages.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'economics', 'society'],
+    },
+
+    // =====================================================================
+    // PART E: 12 SPEAKING PROMPTS (90-Second General DET Topics)
+    // =====================================================================
+    {
+      id: 'sp-det-public-park-design',
+      dayNumber: 1,
+      skill: 'speaking',
+      type: 'speaking-sample',
+      sourceAttribution: 'DET Speaking Bank — Community & Environment',
+      prompt: 'Imagine your city council has acquired a large vacant lot in the center of your neighborhood. How should this space be developed to benefit residents of all ages? Speak for 90 seconds explaining your proposal and its long-term impact.',
+      difficulty: 'hard',
+      tags: ['speaking', 'community', 'urban-planning'],
+    },
+    {
+      id: 'sp-det-traditional-craft',
+      dayNumber: 3,
+      skill: 'speaking',
+      type: 'speaking-sample',
+      sourceAttribution: 'DET Speaking Bank — Culture & Heritage',
+      prompt: 'Describe a traditional craft, culinary practice, or cultural festival that holds special significance in your region. Why is it important to pass this tradition on to younger generations in a modernized world? Speak for 90 seconds.',
+      difficulty: 'hard',
+      tags: ['speaking', 'culture', 'tradition'],
+    },
+    {
+      id: 'sp-det-mentorship-influence',
+      dayNumber: 5,
+      skill: 'speaking',
+      type: 'interactive-speaking',
+      sourceAttribution: 'DET Speaking Bank — Personal Development',
+      prompt: 'Talk about a teacher, mentor, or family member whose daily work ethic or advice shaped the way you approach difficult goals. Give specific examples of how you apply their lessons today. Speak for 90 seconds.',
+      difficulty: 'hard',
+      tags: ['speaking', 'education', 'personal'],
+    },
+    {
+      id: 'sp-det-print-vs-audiobooks',
+      dayNumber: 7,
+      skill: 'speaking',
+      type: 'speaking-sample',
+      sourceAttribution: 'DET Speaking Bank — Media & Learning',
+      prompt: 'Compare the cognitive experience of reading a physical printed book with listening to an audiobook or podcast. In what situations is each format more beneficial for comprehension and retention? Speak for 90 seconds.',
+      difficulty: 'hard',
+      tags: ['speaking', 'education', 'media'],
+    },
+    {
+      id: 'sp-det-tourist-preservation',
+      dayNumber: 9,
+      skill: 'speaking',
+      type: 'interactive-speaking',
+      sourceAttribution: 'DET Speaking Bank — Travel & Environment',
+      prompt: 'When historical monuments or natural wonders become overly popular on social media, visitor numbers can damage the site. What practical measures should local authorities take to balance tourism revenue with preservation? Speak for 90 seconds.',
+      difficulty: 'hard',
+      tags: ['speaking', 'tourism', 'environment'],
+    },
+    {
+      id: 'sp-det-financial-literacy-schools',
+      dayNumber: 11,
+      skill: 'speaking',
+      type: 'speaking-sample',
+      sourceAttribution: 'DET Speaking Bank — Curriculum Policy',
+      prompt: 'Should secondary schools be required to teach practical financial literacy—such as household budgeting, interest rates, and taxes—as a mandatory graduation subject? Defend your position for 90 seconds.',
+      difficulty: 'hard',
+      tags: ['speaking', 'education', 'economics'],
+    },
+    {
+      id: 'sp-det-urban-noise-pollution',
+      dayNumber: 13,
+      skill: 'speaking',
+      type: 'interactive-speaking',
+      sourceAttribution: 'DET Speaking Bank — Public Health',
+      prompt: 'Chronic noise pollution from traffic and construction is an overlooked public health issue in many cities. How does constant noise affect residents, and what architectural or policy solutions can create quieter neighborhoods? Speak for 90 seconds.',
+      difficulty: 'hard',
+      tags: ['speaking', 'health', 'urban-planning'],
+    },
+    {
+      id: 'sp-det-team-disagreement',
+      dayNumber: 15,
+      skill: 'speaking',
+      type: 'interactive-speaking',
+      sourceAttribution: 'DET Speaking Bank — Collaboration',
+      prompt: 'Describe a situation where you worked on a group project or community initiative and team members strongly disagreed on the best approach. How did you help resolve the disagreement and reach a shared outcome? Speak for 90 seconds.',
+      difficulty: 'hard',
+      tags: ['speaking', 'collaboration'],
+    },
+    {
+      id: 'sp-det-cooking-at-home',
+      dayNumber: 17,
+      skill: 'speaking',
+      type: 'speaking-sample',
+      sourceAttribution: 'DET Speaking Bank — Lifestyle & Health',
+      prompt: 'With food delivery services becoming increasingly convenient, fewer young adults cook meals from scratch at home. Discuss the nutritional, financial, and social consequences of this trend for 90 seconds.',
+      difficulty: 'hard',
+      tags: ['speaking', 'health', 'society'],
+    },
+    {
+      id: 'sp-det-foreign-language-empathy',
+      dayNumber: 19,
+      skill: 'speaking',
+      type: 'speaking-sample',
+      sourceAttribution: 'DET Speaking Bank — Language & Culture',
+      prompt: 'How does learning to speak a second or third language change the way a person understands other cultures and perspectives? Provide specific examples from your own language-learning journey for 90 seconds.',
+      difficulty: 'hard',
+      tags: ['speaking', 'language', 'culture'],
+    },
+    {
+      id: 'sp-det-public-transport-free',
+      dayNumber: 21,
+      skill: 'speaking',
+      type: 'interactive-speaking',
+      sourceAttribution: 'DET Speaking Bank — Civic Policy',
+      prompt: 'Evaluate whether making municipal buses and commuter trains completely free of charge is a realistic strategy to reduce urban air pollution and traffic congestion. Speak for 90 seconds.',
+      difficulty: 'hard',
+      tags: ['speaking', 'transit', 'policy'],
+    },
+
+    // =====================================================================
+    // PART F: CURATED YOUTUBE & ACADEMIC SHADOWING / DICTOGLOSS DRILLS
+    // =====================================================================
+    {
+      id: 'yt-boroditsky-ted',
+      dayNumber: 1,
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'TED — Prof. Lera Boroditsky',
+      prompt: 'How Language Shapes the Way We Think: Cognitive Diversity and Spatial Metaphors (TED)',
+      sourceAudioText:
+        'Language is a uniquely human gift central to our human experience. When you compare languages across the world, they differ in profound and surprising ways. Some languages assign grammatical genders to inanimate objects, while others use absolute cardinal directions like north and south instead of relative terms like left and right, fundamentally reorganizing how speakers orient themselves in physical space.',
+      youtubeSource: {
+        clipKey: 'yt_boroditsky_ted',
+        url: 'https://www.youtube.com/watch?v=RKK7wGAYP6k',
+        startTime: '00:20',
+        endTime: '01:35',
+        speaker: 'Prof. Lera Boroditsky (Linguistics & Cognitive Science)',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'ted', 'linguistics', 'academic'],
+    },
+    {
+      id: 'yt-treasure-speaking',
+      dayNumber: 3,
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'TED — Julian Treasure',
+      prompt: 'How to Speak So That People Want to Listen: Prosody, Register, and Vocal Resonance (TED)',
+      sourceAudioText:
+        'The human voice is the instrument we all play. It is the most powerful sound in the world, capable of starting wars or expressing love. Yet many speakers suffer from monotonic cadence and inadequate pause awareness. By calibrating register, timbre, prosodic rhythm, and purposeful silence, an orator commands subconscious cognitive presence.',
+      youtubeSource: {
+        clipKey: 'yt_treasure_speech',
+        url: 'https://www.youtube.com/watch?v=eIho2S0ZahI',
+        startTime: '00:20',
+        endTime: '01:35',
+        speaker: 'Julian Treasure (Sound & Communication Expert)',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'ted', 'speech', 'prosody'],
+    },
+    {
+      id: 'yt-laraboyd-brain',
+      dayNumber: 6,
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'TEDxVancouver — Dr. Lara Boyd',
+      prompt: 'After Watching This, Your Brain Will Not Be the Same: Neuroplasticity and Deliberate Practice (TEDx)',
+      sourceAudioText:
+        'Every single time you practice a difficult cognitive skill, generate spoken language under communicative pressure, or deliberate upon a novel grammatical structure, you are physically reconfiguring your brain. Neuroplasticity operates on three distinct timescales: chemical alterations that modulate neurotransmitter release, structural remodeling that strengthens synaptic connectivity, and functional reorganization that recruits adjacent cortical networks.',
+      youtubeSource: {
+        clipKey: 'yt_laraboyd_neuro',
+        url: 'https://www.youtube.com/watch?v=LNHBMFCzznE',
+        startTime: '00:30',
+        endTime: '01:45',
+        speaker: 'Dr. Lara Boyd (Neuroplasticity & Motor Learning)',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'ted', 'neuroscience', 'deliberate-practice'],
+    },
+    {
+      id: 'yt-boroditsky-duocon',
+      dayNumber: 9,
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'Duocon Keynote — Prof. Lera Boroditsky',
+      prompt: 'Language, Thought, and Mental Representations (Duocon)',
+      sourceAudioText:
+        'When learning a new language, you are not merely memorizing alternative acoustic labels for concepts you already possess. You are inheriting a complex cognitive scaffold that shapes how your attention selects information from continuous visual reality, categorizes sensory stimuli, and commits salient events to episodic memory.',
+      youtubeSource: {
+        clipKey: 'yt_boroditsky_duocon',
+        url: 'https://www.youtube.com/watch?v=kBEBq2eP19k',
+        startTime: '00:30',
+        endTime: '01:45',
+        speaker: 'Prof. Lera Boroditsky (Duocon)',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'duocon', 'linguistics', 'c1-c2'],
+    },
+    {
+      id: 'yt-cambridge-linguistics',
+      dayNumber: 12,
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'Cambridge University Faculty of Linguistics',
+      prompt: 'Suprasegmental Phonology and Clause-Boundary Pacing in High-Stakes Oral Production',
+      sourceAudioText:
+        'Advanced second language proficiency is characterized not merely by lexical breadth, but by the natural execution of suprasegmental features, including intonational pitch contours, tonic stress placement, and the tactical deployment of clause-boundary pauses that permit listeners to parse dense informational density in real time.',
+      youtubeSource: {
+        clipKey: 'yt_cambridge_ling',
+        url: 'https://www.youtube.com/watch?v=7pCskG_V45s',
+        startTime: '00:15',
+        endTime: '01:30',
+        speaker: 'Cambridge University Faculty of Linguistics',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'cambridge', 'linguistics', 'c2-proficiency'],
+    },
+    {
+      id: 'sh-det-urban-ecology',
+      dayNumber: 15,
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'Academic Shadowing — Urban Ecology',
+      prompt: 'Restoring native wetland corridors along municipal riverbanks not only absorbs seasonal floodwaters before they inundate residential neighborhoods, but also re-establishes critical stopover habitats for migratory songbirds.',
+      sourceAudioText:
+        'Restoring native wetland corridors along municipal riverbanks not only absorbs seasonal floodwaters before they inundate residential neighborhoods, but also re-establishes critical stopover habitats for migratory songbirds.',
+      difficulty: 'hard',
+      tags: ['shadowing', 'ecology', 'urban-planning'],
+    },
+    {
+      id: 'sh-bbc-mosquito-equilibrium',
+      dayNumber: 18,
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'BBC Science Focus (Biodiversity)',
+      prompt: 'Deforestation fragments surrounding wildlife corridors, causing disease-carrying mosquitoes to permanently alter their host preferences and seek blood meals from nearby human settlements.',
+      sourceAudioText:
+        'Deforestation fragments surrounding wildlife corridors, causing disease-carrying mosquitoes to permanently alter their host preferences and seek blood meals from nearby human settlements.',
+      difficulty: 'hard',
+      tags: ['shadowing', 'bbc', 'biology'],
+    },
+    {
+      id: 'dg-sla-chunking',
+      dayNumber: 2,
+      skill: 'listening',
+      type: 'listen-and-type',
+      sourceAttribution: 'Second Language Acquisition Research',
+      prompt: 'Second language acquisition research indicates that grammatical accuracy emerges naturally when learners internalize multi-word collocation chunks as unified perceptual units rather than assembling individual words through explicit grammatical rules.',
+      sourceAudioText:
+        'Second language acquisition research indicates that grammatical accuracy emerges naturally when learners internalize multi-word collocation chunks as unified perceptual units rather than assembling individual words through explicit grammatical rules.',
+      sampleAnswer:
+        'Transitioning to advanced language proficiency depends on producing formulaic word chunks automatically under time constraints rather than consciously piecing together individual words.',
+      difficulty: 'hard',
+      tags: ['dictogloss', 'sla', 'pedagogy'],
+    },
+    {
+      id: 'dg-det-architectural-acoustics',
+      dayNumber: 6,
+      skill: 'listening',
+      type: 'listen-and-type',
+      sourceAttribution: 'Architectural Acoustics Lecture',
+      prompt: 'When designing a symphony concert hall, acoustic engineers must balance sound reflection and absorption by contouring wooden wall panels and suspending overhead canopies so that orchestral frequencies reach every balcony without muddy reverberation.',
+      sourceAudioText:
+        'When designing a symphony concert hall, acoustic engineers must balance sound reflection and absorption by contouring wooden wall panels and suspending overhead canopies so that orchestral frequencies reach every balcony without muddy reverberation.',
+      sampleAnswer:
+        'Concert hall architects carefully shape interior surfaces and suspended panels to project clear musical sound throughout the auditorium while preventing excessive echo.',
+      difficulty: 'hard',
+      tags: ['dictogloss', 'architecture', 'arts'],
+    },
+    {
+      id: 'dg-det-sleep-consolidation',
+      dayNumber: 10,
+      skill: 'listening',
+      type: 'listen-and-type',
+      sourceAttribution: 'Cognitive Neuroscience — Memory Consolidation',
+      prompt: 'During slow-wave sleep, the hippocampus replays newly acquired daytime experiences and transfers those fragile neural traces to the neocortex for permanent storage, explaining why sleep deprivation severely impairs long-term exam retention.',
+      sourceAudioText:
+        'During slow-wave sleep, the hippocampus replays newly acquired daytime experiences and transfers those fragile neural traces to the neocortex for permanent storage, explaining why sleep deprivation severely impairs long-term exam retention.',
+      sampleAnswer:
+        'Deep slow-wave sleep is essential for academic learning because the brain actively transfers new memories from short-term hippocampal storage into long-term cortical networks.',
+      difficulty: 'hard',
+      tags: ['dictogloss', 'psychology', 'health'],
+    },
+    {
+      id: 'dg-conversation-brain-capital',
+      dayNumber: 14,
+      skill: 'listening',
+      type: 'listen-and-type',
+      sourceAttribution: 'The Conversation (Public Policy & Health)',
+      prompt: 'Economists argue that national economic productivity increasingly hinges on cognitive resilience, emotional regulation, and lifelong adaptability, making early childhood nutrition and public education the highest-yielding civic investments.',
+      sourceAudioText:
+        'Economists argue that national economic productivity increasingly hinges on cognitive resilience, emotional regulation, and lifelong adaptability, making early childhood nutrition and public education the highest-yielding civic investments.',
+      sampleAnswer:
+        'Investing in public education and cognitive health produces substantial economic returns by equipping citizens with lifelong adaptability.',
+      difficulty: 'hard',
+      tags: ['dictogloss', 'the-conversation', 'economics'],
+    },
+  ];
+}
+
+export class DETDatabase extends Dexie {
+  settings!: Table<Settings, string>;
+  questionBank!: Table<QuestionBankItem, string>;
+  evalPrompts!: Table<EvalPrompt, string>;
+  sessionTemplates!: Table<SessionTemplate, string>;
+  sessionRuns!: Table<SessionRun, string>;
+
+  constructor() {
+    super('det-prep-app');
+    this.version(1).stores({
+      settings: 'id',
+      questionBank: 'id, skill, type, difficulty, srs.nextReviewDate',
+      evalPrompts: 'id, appliesToType',
+      sessionTemplates: 'id, deletedAt',
+      sessionRuns: 'id, templateId, status, startedAt',
+    });
+
+    this.on('populate', () => {
+      void this.populateDefaults();
+    });
+  }
+
+  async populateDefaults(): Promise<void> {
+    const now = new Date().toISOString();
+    const defaultSettings: Settings = {
+      id: 'app-settings',
+      geminiApiKey: '',
+      sttProvider: 'local-whisper',
+      localWhisperUrl: 'http://127.0.0.1:8000/transcribe',
+      localSttEndpoint: 'http://127.0.0.1:8000/transcribe',
+      autoAdvanceDefault: false,
+      instantFeedbackDefault: true,
+      studyPlanStartDate: now,
+      currentPlanDay: 1,
+      completedPlanSlots: {},
+      srsDefaults: {
+        startEase: 2.5,
+        startIntervalDays: 1,
+      },
+    };
+    await this.settings.put(defaultSettings);
+
+    const readingEvalId = 'eval-reading-default';
+    const brainDumpEvalId = 'eval-braindump-default';
+    const vocabEvalId = 'eval-vocab-default';
+    const speakingEvalId = 'eval-speaking-default';
+    const shadowingEvalId = 'eval-shadowing-default';
+    const dictoglossEvalId = 'eval-dictogloss-default';
+    const mockEvalId = 'eval-mock-default';
+
+    await this.evalPrompts.bulkPut([
+      {
+        id: readingEvalId,
+        name: 'DET Interactive Reading & Cloze Evaluator (140-150)',
+        appliesToType: 'interactive-reading',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_WRITING_PROMPT,
+      },
+      {
+        id: brainDumpEvalId,
+        name: 'DET Brain-Dump & Outline Evaluator (140-150)',
+        appliesToType: 'brain-dump',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_WRITING_PROMPT,
+      },
+      {
+        id: vocabEvalId,
+        name: 'DET Collocation Chunk & Writing Evaluator (140-150)',
+        appliesToType: 'vocab-writing',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_WRITING_PROMPT,
+      },
+      {
+        id: speakingEvalId,
+        name: 'DET Timestamped Verbatim Speaking Evaluator (140-150)',
+        appliesToType: 'speaking',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_SPEAKING_PROMPT,
+      },
+      {
+        id: shadowingEvalId,
+        name: 'SLA Shadowing Prosody Evaluator (140-150)',
+        appliesToType: 'shadowing',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_SHADOWING_PROMPT,
+      },
+      {
+        id: dictoglossEvalId,
+        name: 'SLA Dictogloss Working-Memory Evaluator (140-150)',
+        appliesToType: 'dictogloss',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_DICTOGLOSS_PROMPT,
+      },
+      {
+        id: mockEvalId,
+        name: 'DET Mock Test Evaluator (140-150)',
+        appliesToType: 'mock-test',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_WRITING_PROMPT,
+      },
+    ]);
+
+    await this.questionBank.bulkPut(buildRichQuestionBank());
+
+    await this.sessionTemplates.bulkPut(
+      buildDailyPlanTemplates({
+        readingEvalId,
+        vocabEvalId,
+        speakingEvalId,
+        shadowingEvalId,
+        dictoglossEvalId,
+        mockEvalId,
+        now,
+      })
+    );
+  }
+}
+
+export function buildDailyPlanTemplates(ids: {
+  readingEvalId: string;
+  vocabEvalId: string;
+  speakingEvalId: string;
+  shadowingEvalId: string;
+  dictoglossEvalId: string;
+  mockEvalId: string;
+  now: string;
+}): SessionTemplate[] {
+  return [
+    {
+      id: 'tpl-daily-session-1-reading-vocab',
+      name: 'Daily Session 1: Reading & Lexical Precision (15 Min)',
+      description:
+        'Part 1 of 3 Daily Goal: Unseen Read & Complete (3m) -> Unseen 6-Step Interactive Reading (7m) -> Unseen Collocation Chunk Paragraph (5m).',
+      blocks: [
+        {
+          id: 'blk-s1-rc',
+          name: '1. Read & Complete (1-Letter-Per-Box Cloze)',
+          type: 'interactive-reading',
+          preferredQuestionType: 'read-and-complete',
+          durationSec: 3 * 60,
+          instructions: 'Complete the unseen C-test passage under timed conditions.',
+          autoAdvance: false,
+          evalPromptId: ids.readingEvalId,
+        },
+        {
+          id: 'blk-s1-ir',
+          name: '2. Interactive Reading (6-Step Suite)',
+          type: 'interactive-reading',
+          preferredQuestionType: 'interactive-reading',
+          durationSec: 7 * 60,
+          instructions: 'Complete all 6 interactive reading steps on today’s unseen passage.',
+          autoAdvance: false,
+          evalPromptId: ids.readingEvalId,
+        },
+        {
+          id: 'blk-s1-vw',
+          name: '3. Collocation Chunk Precision Writing',
+          type: 'vocab-writing',
+          durationSec: 5 * 60,
+          instructions: 'Write an academic paragraph incorporating all 4 of today’s target collocation chunks.',
+          autoAdvance: false,
+          evalPromptId: ids.vocabEvalId,
+        },
+      ],
+      createdAt: ids.now,
+      updatedAt: ids.now,
+    },
+    {
+      id: 'tpl-daily-session-2-listening-shadowing',
+      name: 'Daily Session 2: Listening, Shadowing & Dictogloss (12 Min)',
+      description:
+        'Part 2 of 3 Daily Goal: Prosody Shadowing (4m) -> Dictogloss Lecture Reconstruction (5m) -> 90s Spoken Transfer (3m).',
+      blocks: [
+        {
+          id: 'blk-s2-sh',
+          name: '1. Auditory-Motor Shadowing (Prosody & Pacing)',
+          type: 'shadowing',
+          durationSec: 4 * 60,
+          instructions: 'Shadow the native speaker simultaneously to build natural clause rhythm and stress.',
+          autoAdvance: false,
+          evalPromptId: ids.shadowingEvalId,
+        },
+        {
+          id: 'blk-s2-dg',
+          name: '2. Dictogloss Working-Memory Reconstruction',
+          type: 'dictogloss',
+          durationSec: 5 * 60,
+          instructions: 'Listen twice while taking 2-4 word fragment notes, then reconstruct the passage.',
+          autoAdvance: false,
+          evalPromptId: ids.dictoglossEvalId,
+        },
+        {
+          id: 'blk-s2-sp',
+          name: '3. 90-Second Spontaneous Speaking Drill',
+          type: 'speaking',
+          preferredQuestionType: 'interactive-speaking',
+          durationSec: 3 * 60,
+          instructions: 'Speak for 90 seconds on today’s unseen prompt while monitoring clause pauses.',
+          autoAdvance: false,
+          evalPromptId: ids.speakingEvalId,
+        },
+      ],
+      createdAt: ids.now,
+      updatedAt: ids.now,
+    },
+    {
+      id: 'tpl-daily-session-3-production-mock',
+      name: 'Daily Session 3: Interactive Writing & Speaking Production (12 Min)',
+      description:
+        'Part 3 of 3 Daily Goal: Unseen Interactive Writing Essay (5m) -> Collocation Refinement (4m) -> 90s Speaking Sample (3m).',
+      blocks: [
+        {
+          id: 'blk-s3-iw',
+          name: '1. Timed Interactive Writing Essay',
+          type: 'mock-test',
+          preferredQuestionType: 'interactive-writing',
+          durationSec: 5 * 60,
+          instructions: 'Write a structured C1/C2 argumentative response to today’s unseen DET writing prompt.',
+          autoAdvance: false,
+          evalPromptId: ids.mockEvalId,
+        },
+        {
+          id: 'blk-s3-vw',
+          name: '2. Collocation Chunk Application Drill',
+          type: 'vocab-writing',
+          durationSec: 4 * 60,
+          instructions: 'Incorporate all 4 new academic collocations into a cohesive paragraph.',
+          autoAdvance: false,
+          evalPromptId: ids.vocabEvalId,
+        },
+        {
+          id: 'blk-s3-sp',
+          name: '3. 90-Second Verbatim Speaking Sample',
+          type: 'speaking',
+          preferredQuestionType: 'speaking-sample',
+          durationSec: 3 * 60,
+          instructions: 'Deliver a 90-second monologue on today’s unseen DET speaking topic.',
+          autoAdvance: false,
+          evalPromptId: ids.speakingEvalId,
+        },
+      ],
+      createdAt: ids.now,
+      updatedAt: ids.now,
+    },
+  ];
+}
+
+export const db = new DETDatabase();
+
+export async function ensureDatabaseUpgraded(): Promise<void> {
+  const now = new Date().toISOString();
+
+  // 0. Ensure settings include 21-day study plan tracking & valid Whisper URL
+  const settings = await db.settings.get('app-settings');
+  if (settings) {
+    const fixedUrl =
+      !settings.localWhisperUrl || settings.localWhisperUrl === 'http://127.0.0.1:8000'
+        ? 'http://127.0.0.1:8000/transcribe'
+        : settings.localWhisperUrl;
+    await db.settings.put({
+      ...settings,
+      localWhisperUrl: fixedUrl,
+      studyPlanStartDate: settings.studyPlanStartDate ?? now,
+      currentPlanDay: settings.currentPlanDay ?? 1,
+      completedPlanSlots: settings.completedPlanSlots ?? {},
+    });
+  }
+
+  // 1. Purge obsolete personalized CS/AI/Cybersecurity prompts from IndexedDB
+  const existingQuestions = await db.questionBank.toArray();
+  const idsToDelete: string[] = [];
+  for (const q of existingQuestions) {
+    const pLower = (q.prompt || '').toLowerCase();
+    const isLegacyPersonalized =
+      OBSOLETE_PERSONALIZED_IDS.has(q.id) ||
+      pLower.includes('cryptographic hash chaining') ||
+      pLower.includes('complex technical project you architected') ||
+      pLower.includes('empirical, methodology, ubiquitous, paradigm') ||
+      pLower.includes('microservices architectures') ||
+      pLower.includes('retaliatory countermeasures') ||
+      pLower.includes('medical device cybersecurity');
+    if (isLegacyPersonalized) {
+      idsToDelete.push(q.id);
+    }
+  }
+  if (idsToDelete.length > 0) {
+    await db.questionBank.bulkDelete(idsToDelete);
+  }
+
+  // 2. Seed all authentic general DET questions while preserving completion history & local audio
+  const remainingQuestions = await db.questionBank.toArray();
+  const existingMap = new Map(remainingQuestions.map((q) => [q.id, q]));
+  const richItems = buildRichQuestionBank();
+
+  const toPut: QuestionBankItem[] = [];
+  for (const item of richItems) {
+    const existing = existingMap.get(item.id);
+    if (!existing) {
+      toPut.push(item);
+    } else {
+      toPut.push({
+        ...item,
+        audioUrl: existing.audioUrl
+          ? existing.audioUrl.replace('http://127.0.0.1:8000/audio/', 'http://127.0.0.1:8000/clips/')
+          : item.audioUrl,
+        srs: existing.srs ?? item.srs,
+        completedAt: existing.completedAt ?? null,
+        timesCompleted: existing.timesCompleted ?? 0,
+      });
+    }
+  }
+  if (toPut.length > 0) {
+    await db.questionBank.bulkPut(toPut);
+  }
+
+  // 3. Ensure all Eval Prompts & the 3 Daily Session Templates exist
+  const prompts = await db.evalPrompts.toArray();
+  const findOrCreateEval = async (
+    id: string,
+    name: string,
+    appliesToType: EvalPrompt['appliesToType'],
+    promptText: string
+  ): Promise<string> => {
+    const found = prompts.find((p) => p.appliesToType === appliesToType);
+    if (found) return found.id;
+    await db.evalPrompts.put({
+      id,
+      name,
+      appliesToType,
+      scoreScale: 'det-0-160',
+      promptText,
+    });
+    return id;
+  };
+
+  const readingEvalId = await findOrCreateEval(
+    'eval-reading-default',
+    'DET Interactive Reading & Cloze Evaluator (140-150)',
+    'interactive-reading',
+    DEFAULT_WRITING_PROMPT
+  );
+  const vocabEvalId = await findOrCreateEval(
+    'eval-vocab-default',
+    'DET Collocation Chunk & Writing Evaluator (140-150)',
+    'vocab-writing',
+    DEFAULT_WRITING_PROMPT
+  );
+  const speakingEvalId = await findOrCreateEval(
+    'eval-speaking-default',
+    'DET Timestamped Verbatim Speaking Evaluator (140-150)',
+    'speaking',
+    DEFAULT_SPEAKING_PROMPT
+  );
+  const shadowingEvalId = await findOrCreateEval(
+    'eval-shadowing-default',
+    'SLA Shadowing Prosody Evaluator (140-150)',
+    'shadowing',
+    DEFAULT_SHADOWING_PROMPT
+  );
+  const dictoglossEvalId = await findOrCreateEval(
+    'eval-dictogloss-default',
+    'SLA Dictogloss Working-Memory Evaluator (140-150)',
+    'dictogloss',
+    DEFAULT_DICTOGLOSS_PROMPT
+  );
+  const mockEvalId = await findOrCreateEval(
+    'eval-mock-default',
+    'DET Mock Test Evaluator (140-150)',
+    'mock-test',
+    DEFAULT_WRITING_PROMPT
+  );
+
+  const dailyTemplates = buildDailyPlanTemplates({
+    readingEvalId,
+    vocabEvalId,
+    speakingEvalId,
+    shadowingEvalId,
+    dictoglossEvalId,
+    mockEvalId,
+    now,
+  });
+  await db.sessionTemplates.bulkPut(dailyTemplates);
+}
+`,
+
+  // =========================================================================
+  // 3. ADAPTIVE & NON-REPEATING SELECTOR: Unseen Questions Always First!
+  // =========================================================================
+  'src/utils/adaptive.ts': `import { db, ensureDatabaseUpgraded } from '../db/database';
+import type { QuestionBankItem, DETQuestionType, DETSkill } from '../types';
+import { getDueItems } from './srs';
+
+/**
+ * Returns the set of all question IDs that the user has already completed
+ * either via explicit question.completedAt or in any previous SessionRun.
+ */
+export async function getCompletedQuestionIds(): Promise<Set<string>> {
+  const completedIds = new Set<string>();
+
+  const allQuestions = await db.questionBank.toArray();
+  for (const q of allQuestions) {
+    if (q.completedAt || (q.timesCompleted && q.timesCompleted > 0)) {
+      completedIds.add(q.id);
+    }
+  }
+
+  const allRuns = await db.sessionRuns.toArray();
+  for (const run of allRuns) {
+    for (const resp of Object.values(run.responses ?? {})) {
+      if (
+        resp.questionId &&
+        Boolean(
+          resp.textOrTranscript?.trim() ||
+            resp.audioBlobRef ||
+            resp.aiOverallScore ||
+            resp.isComplete
+        )
+      ) {
+        completedIds.add(resp.questionId);
+      }
+    }
+  }
+
+  return completedIds;
+}
+
+/**
+ * Marks a question as completed in IndexedDB so that future sessions
+ * automatically advance to the next unseen item in the 21-day bank.
+ */
+export async function markQuestionCompleted(questionId?: string): Promise<void> {
+  if (!questionId) return;
+  const item = await db.questionBank.get(questionId);
+  if (!item) return;
+  await db.questionBank.put({
+    ...item,
+    completedAt: new Date().toISOString(),
+    timesCompleted: (item.timesCompleted ?? 0) + 1,
+  });
+}
+
+/**
+ * Resets completion flags across the question bank if the user wants to start
+ * a fresh 21-day cycle.
+ */
+export async function resetAllQuestionCompletions(): Promise<void> {
+  const all = await db.questionBank.toArray();
+  const reset = all.map((q) => ({
+    ...q,
+    completedAt: null,
+    timesCompleted: 0,
+  }));
+  await db.questionBank.bulkPut(reset);
+}
+
+/**
+ * Selects questions prioritizing:
+ * 1. UNSEEN / UNCOMPLETED questions first (+1000 priority boost) so the user
+ *    never repeats the same passage or prompt during their 21-day plan.
+ * 2. Questions assigned to the current or earlier study plan day.
+ * 3. Spaced Repetition (SM-2) due status & weakest skill weighting.
+ */
+export async function getAdaptiveQuestions(options: {
+  skill?: DETSkill;
+  questionType?: DETQuestionType | 'all' | 'adaptive';
+  tagsInclude?: string;
+  limit?: number;
+}): Promise<{
+  selected: QuestionBankItem[];
+  weakestSkill: DETSkill | null;
+  dueCount: number;
+  unseenCount: number;
+  completedIds: Set<string>;
+}> {
+  await ensureDatabaseUpgraded();
+  const allQuestions = await db.questionBank.toArray();
+  const completedIds = await getCompletedQuestionIds();
+  const settings = await db.settings.get('app-settings');
+  const currentPlanDay = settings?.currentPlanDay ?? 1;
+
+  const completedRuns = await db.sessionRuns
+    .where('status')
+    .equals('completed')
+    .reverse()
+    .sortBy('startedAt');
+
+  const skillTotals: Record<DETSkill, { sum: number; count: number }> = {
+    reading: { sum: 0, count: 0 },
+    writing: { sum: 0, count: 0 },
+    speaking: { sum: 0, count: 0 },
+    listening: { sum: 0, count: 0 },
+  };
+
+  for (const run of completedRuns.slice(0, 12)) {
+    for (const resp of Object.values(run.responses)) {
+      if (!resp.aiOverallScore) continue;
+      if (resp.type === 'speaking' || resp.type === 'shadowing') {
+        skillTotals.speaking.sum += resp.aiOverallScore;
+        skillTotals.speaking.count += 1;
+      } else if (resp.type === 'vocab-writing' || resp.type === 'brain-dump') {
+        skillTotals.writing.sum += resp.aiOverallScore;
+        skillTotals.writing.count += 1;
+      } else if (resp.type === 'dictogloss') {
+        skillTotals.listening.sum += resp.aiOverallScore;
+        skillTotals.listening.count += 1;
+      } else {
+        skillTotals.reading.sum += resp.aiOverallScore;
+        skillTotals.reading.count += 1;
+      }
+    }
+  }
+
+  let weakestSkill: DETSkill | null = null;
+  let lowestAvg = 999;
+  for (const [skill, stats] of Object.entries(skillTotals) as [
+    DETSkill,
+    { sum: number; count: number }
+  ][]) {
+    if (stats.count > 0) {
+      const avg = stats.sum / stats.count;
+      if (avg < lowestAvg) {
+        lowestAvg = avg;
+        weakestSkill = skill;
+      }
+    }
+  }
+
+  let pool = [...allQuestions];
+
+  if (
+    options.questionType &&
+    options.questionType !== 'all' &&
+    options.questionType !== 'adaptive'
+  ) {
+    const byType = pool.filter((q) => q.type === options.questionType);
+    if (byType.length > 0) pool = byType;
+  } else if (options.skill) {
+    const bySkill = pool.filter((q) => q.skill === options.skill);
+    if (bySkill.length > 0) pool = bySkill;
+  }
+
+  if (options.tagsInclude) {
+    const byTag = pool.filter((q) => q.tags.includes(options.tagsInclude!));
+    if (byTag.length > 0) pool = byTag;
+  }
+
+  const dueItems = getDueItems(pool);
+  const dueIds = new Set(dueItems.map((d) => d.id));
+  const unseenCount = pool.filter((q) => !completedIds.has(q.id)).length;
+
+  const scored = pool.map((q) => {
+    let weight = 0;
+    const isCompleted = completedIds.has(q.id);
+
+    // 1. Huge priority boost for UNSEEN questions so questions never repeat!
+    if (!isCompleted) {
+      weight += 1000;
+    } else {
+      // Penalize by how many times it was already completed
+      weight -= (q.timesCompleted ?? 1) * 150;
+    }
+
+    // 2. Prioritize items scheduled for the user's current 21-day plan day
+    if (q.dayNumber !== undefined) {
+      if (q.dayNumber === currentPlanDay) weight += 120;
+      else if (q.dayNumber < currentPlanDay && !isCompleted) weight += 80;
+      else weight += Math.max(0, 40 - Math.abs(q.dayNumber - currentPlanDay));
+    }
+
+    // 3. SRS Due & Weakest Skill
+    if (dueIds.has(q.id)) weight += 50;
+    if (weakestSkill && q.skill === weakestSkill) weight += 30;
+    if (q.difficulty === 'hard' || q.difficulty === 4 || q.difficulty === 5) weight += 15;
+
+    return { item: q, weight };
+  });
+
+  scored.sort((a, b) => b.weight - a.weight);
+
+  return {
+    selected: scored.slice(0, options.limit ?? 30).map((s) => s.item),
+    weakestSkill,
+    dueCount: dueItems.length,
+    unseenCount,
+    completedIds,
+  };
+}
+`,
+};
+
+const cwd = process.cwd();
+for (const [relPath, content] of Object.entries(files)) {
+  const targetPath = path.join(cwd, relPath);
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.writeFileSync(targetPath, content, 'utf8');
+  console.log('Phase 1 (21-Day Bank & Non-Repeating Selector) Updated:', path.relative(cwd, targetPath));
+}
+console.log('\nPhase 1 complete! Ready for Phase 2 whenever you are.');

@@ -3,6 +3,10 @@ import { useSessionStore } from '../../../stores/sessionStore';
 import { AudioRecorderService } from '../../../services/audioRecorder';
 import { createSTTProvider, analyzeSpeechTranscript } from '../../../services/stt';
 import { db } from '../../../db/database';
+import {
+  getCompletedQuestionIds,
+  markQuestionCompleted,
+} from '../../../utils/adaptive';
 import type { BlockConfig, QuestionBankItem } from '../../../types';
 import { WhisperLiveIndicator } from '../../common/WhisperLiveIndicator';
 
@@ -41,6 +45,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
   const updateResponse = useSessionStore((s) => s.updateResponse);
 
   const [passages, setPassages] = useState<QuestionBankItem[]>([]);
+  const [completedIds, setCompletedIds] = useState<Set<string>>(new Set());
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [speechRate, setSpeechRate] = useState<number>(block.speechSpeed ?? 1.0);
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
@@ -63,7 +68,12 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
   }, [block.id, block.speechSpeed, block.blindShadowing]);
 
   const loadShadowingPassages = useCallback(async () => {
-    const all = await db.questionBank.toArray();
+    const [all, doneSet] = await Promise.all([
+      db.questionBank.toArray(),
+      getCompletedQuestionIds(),
+    ]);
+    setCompletedIds(doneSet);
+
     let manifest: Record<string, { audioUrl: string; text: string }> = {};
     try {
       const res = await fetch(`${BACKEND_BASE}/audio/manifest`);
@@ -102,17 +112,26 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
         q.type === 'read-aloud' ||
         Boolean(q.sourceAudioText)
     );
-    shadowItems.sort(
-      (a, b) =>
-        (b.audioUrl ? 2 : b.youtubeSource ? 1 : 0) -
-        (a.audioUrl ? 2 : a.youtubeSource ? 1 : 0)
-    );
+
+    // Sort UNSEEN items first, then by human audio availability
+    shadowItems.sort((a, b) => {
+      const aDone = doneSet.has(a.id) ? 1 : 0;
+      const bDone = doneSet.has(b.id) ? 1 : 0;
+      if (aDone !== bDone) return aDone - bDone;
+      const aAudio = a.audioUrl ? 2 : a.youtubeSource ? 1 : 0;
+      const bAudio = b.audioUrl ? 2 : b.youtubeSource ? 1 : 0;
+      return bAudio - aAudio;
+    });
+
     const finalList = shadowItems.length > 0 ? shadowItems : updatedItems;
     setPassages(finalList);
 
     if (block.questionSetId) {
       const pinnedIdx = finalList.findIndex((q) => q.id === block.questionSetId);
       if (pinnedIdx >= 0) setSelectedIdx(pinnedIdx);
+    } else {
+      const firstUnseen = finalList.findIndex((q) => !doneSet.has(q.id));
+      if (firstUnseen >= 0) setSelectedIdx(firstUnseen);
     }
   }, [block.questionSetId]);
 
@@ -132,7 +151,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
   const sourceText =
     currentItem?.sourceAudioText ||
     currentItem?.prompt ||
-    'While automated static analysis accelerates vulnerability discovery across large codebases, human security critics remain indispensable for verifying complex business logic and preventing subtle authentication bypasses.';
+    'Restoring native wetland corridors along municipal riverbanks not only absorbs seasonal floodwaters before they inundate residential neighborhoods, but also re-establishes critical stopover habitats for migratory songbirds.';
 
   useEffect(() => {
     const el = audioPlayerRef.current;
@@ -269,6 +288,11 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
       const actualDuration = result.durationSec ?? Math.max(5, recordDurationRef.current);
       const stats = analyzeSpeechTranscript(result.text, actualDuration);
 
+      if (currentItem?.id) {
+        void markQuestionCompleted(currentItem.id);
+        setCompletedIds((prev) => new Set(prev).add(currentItem.id));
+      }
+
       updateResponse(block.id, {
         audioBlobRef: dataUrl,
         textOrTranscript: result.text || '[No speech detected]',
@@ -310,7 +334,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
           </span>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
           <label className="text-xs font-semibold text-slate-600">Speed:</label>
           {[0.85, 0.95, 1.0, 1.1].map((rate) => (
             <button
@@ -333,13 +357,17 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
                 stopNativeAudio();
                 setSelectedIdx(Number(e.target.value));
               }}
-              className="text-xs font-semibold text-primary-800 bg-primary-50 border border-primary-200 px-2.5 py-1 rounded-lg cursor-pointer max-w-[220px]"
+              className="text-xs font-semibold text-primary-800 bg-primary-50 border border-primary-200 px-2.5 py-1 rounded-lg cursor-pointer max-w-[240px]"
             >
-              {passages.map((p, idx) => (
-                <option key={p.id} value={idx}>
-                  #{idx + 1} {p.sourceAttribution || p.prompt.slice(0, 35)}
-                </option>
-              ))}
+              {passages.map((p, idx) => {
+                const isDone = completedIds.has(p.id);
+                return (
+                  <option key={p.id} value={idx}>
+                    {isDone ? '✓ [Done] ' : '✨ [Unseen] '}
+                    {p.sourceAttribution || p.prompt.slice(0, 35)}
+                  </option>
+                );
+              })}
             </select>
           )}
         </div>

@@ -1,6 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSessionStore } from '../../../stores/sessionStore';
 import { db } from '../../../db/database';
+import {
+  getCompletedQuestionIds,
+  markQuestionCompleted,
+} from '../../../utils/adaptive';
 import type { BlockConfig, QuestionBankItem } from '../../../types';
 
 const BACKEND_BASE = 'http://127.0.0.1:8000';
@@ -16,6 +20,7 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
   const communicativePressure = useSessionStore((s) => s.activeRun?.communicativePressure);
 
   const [passages, setPassages] = useState<QuestionBankItem[]>([]);
+  const [completedIds, setCompletedIds] = useState<Set<string>>(new Set());
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [phase, setPhase] = useState<'listen' | 'reconstruct'>('listen');
   const [playCount, setPlayCount] = useState(0);
@@ -29,7 +34,12 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
 
   useEffect(() => {
     const loadDictoglossItems = async () => {
-      const all = await db.questionBank.toArray();
+      const [all, doneSet] = await Promise.all([
+        db.questionBank.toArray(),
+        getCompletedQuestionIds(),
+      ]);
+      setCompletedIds(doneSet);
+
       let manifest: Record<string, { audioUrl: string; text: string }> = {};
       try {
         const res = await fetch(`${BACKEND_BASE}/audio/manifest`);
@@ -58,13 +68,24 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
       const items = hydrated.filter(
         (q) => Boolean(q.audioUrl) || q.tags.includes('dictogloss') || q.skill === 'listening'
       );
-      items.sort((a, b) => (b.audioUrl ? 1 : 0) - (a.audioUrl ? 1 : 0));
+
+      // Sort UNSEEN passages first, then by human audio availability
+      items.sort((a, b) => {
+        const aDone = doneSet.has(a.id) ? 1 : 0;
+        const bDone = doneSet.has(b.id) ? 1 : 0;
+        if (aDone !== bDone) return aDone - bDone;
+        return (b.audioUrl ? 1 : 0) - (a.audioUrl ? 1 : 0);
+      });
+
       const finalList = items.length > 0 ? items : hydrated;
       setPassages(finalList);
 
       if (block.questionSetId) {
         const pinnedIdx = finalList.findIndex((q) => q.id === block.questionSetId);
         if (pinnedIdx >= 0) setSelectedIdx(pinnedIdx);
+      } else {
+        const firstUnseen = finalList.findIndex((q) => !doneSet.has(q.id));
+        if (firstUnseen >= 0) setSelectedIdx(firstUnseen);
       }
     };
     void loadDictoglossItems();
@@ -132,7 +153,7 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
             Phase 1: Listen & take compressed 2-4 word fragment notes. Phase 2: Reconstruct full meaning from memory.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {passages.length > 1 && (
             <select
               value={selectedIdx}
@@ -140,13 +161,17 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
                 setPlayCount(0);
                 setSelectedIdx(Number(e.target.value));
               }}
-              className="px-2.5 py-1.5 text-xs font-semibold text-slate-700 border border-slate-200 rounded-lg cursor-pointer max-w-[200px]"
+              className="px-2.5 py-1.5 text-xs font-semibold text-slate-700 border border-slate-200 rounded-lg cursor-pointer max-w-[220px]"
             >
-              {passages.map((p, idx) => (
-                <option key={p.id} value={idx}>
-                  #{idx + 1} {p.sourceAttribution || p.prompt.slice(0, 32)}
-                </option>
-              ))}
+              {passages.map((p, idx) => {
+                const isDone = completedIds.has(p.id);
+                return (
+                  <option key={p.id} value={idx}>
+                    {isDone ? '✓ [Done] ' : '✨ [Unseen] '}
+                    {p.sourceAttribution || p.prompt.slice(0, 32)}
+                  </option>
+                );
+              })}
             </select>
           )}
           <button
@@ -253,13 +278,19 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
           <textarea
             value={reconstructedText}
             onKeyDown={handleReconstructionKeyDown}
-            onChange={(e) =>
+            onChange={(e) => {
+              const val = e.target.value;
+              const wc = val.trim() ? val.trim().split(/\s+/).length : 0;
               updateResponse(block.id, {
-                textOrTranscript: e.target.value,
+                textOrTranscript: val,
                 promptSnapshot: sourcePassage,
                 questionId: currentItem?.id,
-              })
-            }
+              });
+              if (wc >= 25 && currentItem && !completedIds.has(currentItem.id)) {
+                void markQuestionCompleted(currentItem.id);
+                setCompletedIds((prev) => new Set(prev).add(currentItem.id));
+              }
+            }}
             placeholder="Reconstruct the passage's full meaning using complex subordination (whereas, consequently, while) and academic collocations..."
             className="w-full min-h-[240px] p-4 text-base text-slate-800 bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-400"
             autoFocus

@@ -1,6 +1,17 @@
-import { useState, useEffect, useMemo, useRef, type KeyboardEvent, type ChangeEvent } from 'react';
+import {
+  useState,
+  useEffect,
+  useMemo,
+  useRef,
+  type KeyboardEvent,
+  type ChangeEvent,
+} from 'react';
 import { useSessionStore } from '../../../stores/sessionStore';
 import { db, ensureDatabaseUpgraded } from '../../../db/database';
+import {
+  getCompletedQuestionIds,
+  markQuestionCompleted,
+} from '../../../utils/adaptive';
 import type { BlockConfig, QuestionBankItem, ReadAndCompleteBlank } from '../../../types';
 
 const STEP_LABELS = [
@@ -144,6 +155,7 @@ export function InteractiveReadingBlock({
       : 'read-and-complete');
 
   const [questions, setQuestions] = useState<QuestionBankItem[]>([]);
+  const [completedIds, setCompletedIds] = useState<Set<string>>(new Set());
   const [mode, setMode] = useState<'interactive-reading' | 'read-and-complete'>(initialMode);
   const [currentIdx, setCurrentIdx] = useState(0);
 
@@ -176,26 +188,42 @@ export function InteractiveReadingBlock({
   }, [forcedMode, block.preferredQuestionType]);
 
   useEffect(() => {
-    ensureDatabaseUpgraded()
-      .then(() => db.questionBank.toArray())
-      .then((all) => {
-        const readingItems = all.filter(
-          (q) =>
-            q.skill === 'reading' &&
-            (q.type === 'interactive-reading' || q.type === 'read-and-complete')
-        );
-        setQuestions(readingItems);
+    void ensureDatabaseUpgraded().then(async () => {
+      const [all, doneSet] = await Promise.all([
+        db.questionBank.toArray(),
+        getCompletedQuestionIds(),
+      ]);
+      setCompletedIds(doneSet);
 
-        if (block.questionSetId) {
-          const pinned = readingItems.find((q) => q.id === block.questionSetId);
-          if (pinned && (pinned.type === 'read-and-complete' || pinned.type === 'interactive-reading')) {
-            setMode(pinned.type);
-            const subset = readingItems.filter((q) => q.type === pinned.type);
-            const idx = subset.findIndex((q) => q.id === pinned.id);
-            if (idx >= 0) setCurrentIdx(idx);
-          }
-        }
+      const readingItems = all.filter(
+        (q) =>
+          q.skill === 'reading' &&
+          (q.type === 'interactive-reading' || q.type === 'read-and-complete')
+      );
+
+      // Sort UNSEEN passages first, then by assigned 21-day plan dayNumber
+      readingItems.sort((a, b) => {
+        const aDone = doneSet.has(a.id) ? 1 : 0;
+        const bDone = doneSet.has(b.id) ? 1 : 0;
+        if (aDone !== bDone) return aDone - bDone;
+        return (a.dayNumber ?? 99) - (b.dayNumber ?? 99);
       });
+
+      setQuestions(readingItems);
+
+      if (block.questionSetId) {
+        const pinned = readingItems.find((q) => q.id === block.questionSetId);
+        if (
+          pinned &&
+          (pinned.type === 'read-and-complete' || pinned.type === 'interactive-reading')
+        ) {
+          setMode(pinned.type);
+          const subset = readingItems.filter((q) => q.type === pinned.type);
+          const idx = subset.findIndex((q) => q.id === pinned.id);
+          if (idx >= 0) setCurrentIdx(idx);
+        }
+      }
+    });
   }, [block.questionSetId]);
 
   const filteredList = useMemo(
@@ -224,6 +252,17 @@ export function InteractiveReadingBlock({
   const handleSwitchPassage = (nextIndex: number) => {
     setCurrentIdx(nextIndex);
     resetStates();
+  };
+
+  const handleJumpToNextUnseenPassage = () => {
+    const nextUnseenIdx = filteredList.findIndex(
+      (q, i) => i !== currentIdx && !completedIds.has(q.id)
+    );
+    if (nextUnseenIdx >= 0) {
+      handleSwitchPassage(nextUnseenIdx);
+    } else if (filteredList.length > 1) {
+      handleSwitchPassage((currentIdx + 1) % filteredList.length);
+    }
   };
 
   const handleGradeInteractiveReading = () => {
@@ -284,6 +323,10 @@ export function InteractiveReadingBlock({
     const detScore = Math.round(70 + accuracy * 90);
     setSubmittedReading(true);
 
+    // Mark completed so it never repeats automatically!
+    void markQuestionCompleted(activeItem.id);
+    setCompletedIds((prev) => new Set(prev).add(activeItem.id));
+
     const summaryTranscript = [
       `[Interactive Reading — ${ir.sourceName}]`,
       `Accuracy: ${earned}/${totalPossible} (${Math.round(accuracy * 100)}%) -> Estimated DET Band: ${detScore}/160`,
@@ -340,6 +383,10 @@ export function InteractiveReadingBlock({
     const detScore = Math.round(70 + accuracy * 90);
     setSubmittedCloze(true);
     setLastClozeScore({ earned, total, detScore });
+
+    // Mark completed in DB so next session automatically loads a new unseen passage!
+    void markQuestionCompleted(activeItem.id);
+    setCompletedIds((prev) => new Set(prev).add(activeItem.id));
 
     const summaryTranscript = `[Read and Complete — ${rc.sourceName}] Score: ${earned}/${total} (${detScore}/160). ${
       missedWords.length > 0
@@ -453,15 +500,20 @@ export function InteractiveReadingBlock({
     );
   };
 
+  const rcList = questions.filter((q) => q.type === 'read-and-complete');
+  const irList = questions.filter((q) => q.type === 'interactive-reading');
+  const unseenInMode = filteredList.filter((q) => !completedIds.has(q.id)).length;
+
   return (
     <div className="space-y-4">
       <div className="bg-white border border-slate-200 rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-2xs">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
             onClick={() => {
               setMode('read-and-complete');
-              setCurrentIdx(0);
+              const firstUnseen = rcList.findIndex((q) => !completedIds.has(q.id));
+              setCurrentIdx(firstUnseen >= 0 ? firstUnseen : 0);
               resetStates();
             }}
             className={`px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer transition-colors ${
@@ -470,13 +522,14 @@ export function InteractiveReadingBlock({
                 : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
             }`}
           >
-            ✍️ Read and Complete ({questions.filter((q) => q.type === 'read-and-complete').length} Passages)
+            ✍️ Read and Complete ({rcList.filter((q) => !completedIds.has(q.id)).length}/{rcList.length} Unseen)
           </button>
           <button
             type="button"
             onClick={() => {
               setMode('interactive-reading');
-              setCurrentIdx(0);
+              const firstUnseen = irList.findIndex((q) => !completedIds.has(q.id));
+              setCurrentIdx(firstUnseen >= 0 ? firstUnseen : 0);
               resetStates();
             }}
             className={`px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer transition-colors ${
@@ -485,38 +538,37 @@ export function InteractiveReadingBlock({
                 : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
             }`}
           >
-            📖 Interactive Reading ({questions.filter((q) => q.type === 'interactive-reading').length} Suites)
+            📖 Interactive Reading ({irList.filter((q) => !completedIds.has(q.id)).length}/{irList.length} Unseen)
           </button>
         </div>
 
-        {filteredList.length > 1 && (
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() =>
-                handleSwitchPassage((currentIdx - 1 + filteredList.length) % filteredList.length)
-              }
-              className="px-2.5 py-1 text-xs font-semibold border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
-            >
-              ← Prev
-            </button>
+        {filteredList.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-bold text-primary-700 bg-primary-50 px-2.5 py-1 rounded-full">
+              ✨ {unseenInMode} Unseen Left
+            </span>
             <select
               value={currentIdx}
               onChange={(e) => handleSwitchPassage(Number(e.target.value))}
-              className="text-xs font-semibold text-slate-800 border border-slate-200 rounded-lg px-2 py-1"
+              className="text-xs font-semibold text-slate-800 border border-slate-300 rounded-lg px-2.5 py-1.5 bg-slate-50 max-w-xs"
             >
-              {filteredList.map((item, idx) => (
-                <option key={item.id} value={idx}>
-                  Passage {idx + 1}: {item.readAndComplete?.title || item.prompt.slice(0, 42)}
-                </option>
-              ))}
+              {filteredList.map((item, idx) => {
+                const isDone = completedIds.has(item.id);
+                return (
+                  <option key={item.id} value={idx}>
+                    {isDone ? '✓ [Done] ' : '✨ [Unseen] '}
+                    {item.dayNumber ? `Day ${item.dayNumber}: ` : `#${idx + 1}: `}
+                    {item.readAndComplete?.title || item.prompt.slice(0, 42)}
+                  </option>
+                );
+              })}
             </select>
             <button
               type="button"
-              onClick={() => handleSwitchPassage((currentIdx + 1) % filteredList.length)}
-              className="px-2.5 py-1 text-xs font-semibold border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+              onClick={handleJumpToNextUnseenPassage}
+              className="px-3 py-1.5 text-xs font-bold bg-slate-900 text-white rounded-lg hover:bg-slate-800 cursor-pointer"
             >
-              Next →
+              Next Unseen →
             </button>
           </div>
         )}
@@ -526,9 +578,16 @@ export function InteractiveReadingBlock({
         <div className="bg-white border-2 border-slate-200 rounded-2xl p-6 space-y-5 shadow-xs">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
             <div>
-              <span className="text-xs font-bold uppercase tracking-wider text-accent-700 bg-accent-50 px-2.5 py-1 rounded">
-                Type the missing letters • Source: {rc.sourceName}
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold uppercase tracking-wider text-accent-700 bg-accent-50 px-2.5 py-1 rounded">
+                  Type the missing letters • {rc.sourceName}
+                </span>
+                {activeItem?.dayNumber && (
+                  <span className="text-xs font-mono font-bold text-slate-600 bg-slate-100 px-2 py-0.5 rounded">
+                    Plan Day {activeItem.dayNumber}
+                  </span>
+                )}
+              </div>
               <h3 className="text-lg font-bold text-slate-900 mt-1.5">{rc.title}</h3>
             </div>
 
@@ -548,10 +607,10 @@ export function InteractiveReadingBlock({
               {submittedCloze && filteredList.length > 1 && (
                 <button
                   type="button"
-                  onClick={() => handleSwitchPassage((currentIdx + 1) % filteredList.length)}
+                  onClick={handleJumpToNextUnseenPassage}
                   className="px-4 py-2 bg-slate-900 text-white text-xs font-bold rounded-lg hover:bg-slate-800 cursor-pointer"
                 >
-                  Next Paragraph ({((currentIdx + 1) % filteredList.length) + 1}/{filteredList.length}) →
+                  Next Unseen Passage →
                 </button>
               )}
             </div>
@@ -571,7 +630,7 @@ export function InteractiveReadingBlock({
 
               return (
                 <SegmentedWordBlank
-                  key={bId}
+                  key={`${activeItem?.id}-${bId}`}
                   blank={blank}
                   value={prefixInputs[bId] ?? ''}
                   submitted={submittedCloze}
@@ -822,13 +881,24 @@ export function InteractiveReadingBlock({
                     Next Step ({step + 2}/6) →
                   </button>
                 ) : (
-                  <button
-                    type="button"
-                    onClick={handleGradeInteractiveReading}
-                    className="px-5 py-2 bg-green-600 text-white text-xs font-bold rounded-lg hover:bg-green-700 cursor-pointer shadow-xs"
-                  >
-                    ✓ Check All 6 Answers & Score
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleGradeInteractiveReading}
+                      className="px-4 py-2 bg-green-600 text-white text-xs font-bold rounded-lg hover:bg-green-700 cursor-pointer shadow-xs"
+                    >
+                      ✓ Check All 6 Answers
+                    </button>
+                    {submittedReading && filteredList.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={handleJumpToNextUnseenPassage}
+                        className="px-3 py-2 bg-slate-900 text-white text-xs font-bold rounded-lg hover:bg-slate-800 cursor-pointer"
+                      >
+                        Next Unseen →
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
             </div>

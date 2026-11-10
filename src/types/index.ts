@@ -49,6 +49,9 @@ export interface Settings {
   autoAdvanceDefault: boolean;
   instantFeedbackDefault?: boolean;
   srsDefaults: SRSDefaults;
+  studyPlanStartDate?: string;
+  currentPlanDay?: number;
+  completedPlanSlots?: Record<string, string>; // key: "day-1-session-1" -> ISO timestamp
 }
 
 export interface ClozeBlankItem {
@@ -113,6 +116,9 @@ export interface QuestionBankItem {
   difficulty: number | 'easy' | 'mid' | 'hard';
   tags: string[];
   srs?: SRSData;
+  dayNumber?: number; // 1 to 21 assignment
+  completedAt?: string | null;
+  timesCompleted?: number;
 }
 
 export interface EvalPrompt {
@@ -201,6 +207,8 @@ export interface SessionRun {
   instantFeedback?: boolean;
   communicativePressure?: boolean;
   preferredQuestionType?: DETQuestionType | 'all' | 'adaptive';
+  planDay?: number;
+  planSlotIndex?: number;
   startedAt: string;
   endedAt: string | null;
   responses: Record<string, BlockResponse>;
