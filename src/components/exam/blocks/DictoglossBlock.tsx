@@ -3,6 +3,8 @@ import { useSessionStore } from '../../../stores/sessionStore';
 import { db } from '../../../db/database';
 import type { BlockConfig, QuestionBankItem } from '../../../types';
 
+const BACKEND_BASE = 'http://127.0.0.1:8000';
+
 export function DictoglossBlock({ block }: { block: BlockConfig }) {
   const draftResponses = useSessionStore((s) => s.draftResponses);
   const updateResponse = useSessionStore((s) => s.updateResponse);
@@ -21,13 +23,37 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
   const reconstructedText = response?.textOrTranscript ?? '';
 
   useEffect(() => {
-    db.questionBank.toArray().then((all) => {
-      const items = all.filter(
+    const loadDictoglossItems = async () => {
+      const all = await db.questionBank.toArray();
+      let manifest: Record<string, { audioUrl: string; text: string }> = {};
+      try {
+        const res = await fetch(`${BACKEND_BASE}/audio/manifest`);
+        if (res.ok) {
+          manifest = (await res.json()) as Record<string, { audioUrl: string; text: string }>;
+        }
+      } catch {
+        // Offline or manifest empty
+      }
+
+      const hydrated = all.map((q) => {
+        if (q.youtubeSource?.clipKey && manifest[q.youtubeSource.clipKey] && !q.audioUrl) {
+          const cached = manifest[q.youtubeSource.clipKey];
+          return {
+            ...q,
+            audioUrl: cached.audioUrl,
+            sourceAudioText: cached.text || q.sourceAudioText,
+          };
+        }
+        return q;
+      });
+
+      const items = hydrated.filter(
         (q) => Boolean(q.audioUrl) || q.tags.includes('dictogloss') || q.skill === 'listening'
       );
       items.sort((a, b) => (b.audioUrl ? 1 : 0) - (a.audioUrl ? 1 : 0));
-      setPassages(items.length > 0 ? items : all);
-    });
+      setPassages(items.length > 0 ? items : hydrated);
+    };
+    void loadDictoglossItems();
     return () => {
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
@@ -159,9 +185,9 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
               className="px-5 py-2.5 bg-accent-600 hover:bg-accent-700 text-white text-xs font-bold rounded-xl disabled:opacity-50 cursor-pointer"
             >
               {isPlaying
-                ? 'Playing Human Lecture Audio...'
+                ? 'Playing Lecture Audio...'
                 : playCount === 0
-                ? '▶ Play Human Audio (1st Listen: Comprehension)'
+                ? '▶ Play Passage (1st Listen: Comprehension)'
                 : '▶ Play Again (2nd Listen: Fragment Note-Taking)'}
             </button>
           </div>

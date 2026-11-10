@@ -1,7 +1,7 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef, type KeyboardEvent, type ChangeEvent } from 'react';
 import { useSessionStore } from '../../../stores/sessionStore';
-import { db } from '../../../db/database';
-import type { BlockConfig, QuestionBankItem } from '../../../types';
+import { db, ensureDatabaseUpgraded } from '../../../db/database';
+import type { BlockConfig, QuestionBankItem, ReadAndCompleteBlank } from '../../../types';
 
 const STEP_LABELS = [
   '1. Complete the Sentences',
@@ -11,6 +11,122 @@ const STEP_LABELS = [
   '5. Identify the Idea',
   '6. Title the Passage',
 ];
+
+function SegmentedWordBlank({
+  blank,
+  value,
+  submitted,
+  onChange,
+}: {
+  blank: ReadAndCompleteBlank;
+  value: string;
+  submitted: boolean;
+  onChange: (newVal: string) => void;
+}) {
+  const len = blank.missingSuffix.length;
+  const boxRefs = useRef<(HTMLInputElement | null)[]>([]);
+
+  const chars = Array.from({ length: len }, (_, i) => value[i] ?? '');
+  const isCorrect =
+    submitted && value.trim().toLowerCase() === blank.missingSuffix.toLowerCase();
+  const isWrong =
+    submitted && value.trim().toLowerCase() !== blank.missingSuffix.toLowerCase();
+
+  const updateCharAt = (index: number, char: string) => {
+    const next = [...chars];
+    next[index] = char;
+    onChange(next.join(''));
+  };
+
+  const handleKeyDown = (index: number, e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Backspace') {
+      e.preventDefault();
+      if (chars[index]) {
+        updateCharAt(index, '');
+      } else if (index > 0) {
+        updateCharAt(index - 1, '');
+        boxRefs.current[index - 1]?.focus();
+      }
+      return;
+    }
+    if (e.key === 'ArrowLeft' && index > 0) {
+      e.preventDefault();
+      boxRefs.current[index - 1]?.focus();
+      return;
+    }
+    if (e.key === 'ArrowRight' && index < len - 1) {
+      e.preventDefault();
+      boxRefs.current[index + 1]?.focus();
+      return;
+    }
+  };
+
+  const handleInput = (index: number, e: ChangeEvent<HTMLInputElement>) => {
+    const raw = e.target.value;
+    if (!raw) {
+      updateCharAt(index, '');
+      return;
+    }
+    const clean = raw.replace(/[^a-zA-Z-]/g, '');
+    if (!clean) return;
+
+    if (clean.length === 1) {
+      updateCharAt(index, clean);
+      if (index < len - 1) {
+        boxRefs.current[index + 1]?.focus();
+      }
+    } else {
+      const next = [...chars];
+      for (let i = 0; i < clean.length && index + i < len; i++) {
+        next[index + i] = clean[i];
+      }
+      onChange(next.join(''));
+      const nextFocus = Math.min(len - 1, index + clean.length);
+      boxRefs.current[nextFocus]?.focus();
+    }
+  };
+
+  return (
+    <span className="inline-flex items-center mx-1 my-0.5 align-baseline">
+      <span className="font-bold text-slate-900 font-mono text-base px-1 py-0.5 bg-slate-200/80 rounded-l-md border border-r-0 border-slate-300">
+        {blank.prefix}
+      </span>
+
+      <span className="inline-flex items-center">
+        {chars.map((ch, i) => (
+          <input
+            key={i}
+            ref={(el) => {
+              boxRefs.current[i] = el;
+            }}
+            type="text"
+            inputMode="text"
+            maxLength={2}
+            value={ch}
+            onChange={(e) => handleInput(i, e)}
+            onKeyDown={(e) => handleKeyDown(i, e)}
+            aria-label={`${blank.prefix} letter ${i + 1} of ${len}`}
+            className={`w-6 h-7 text-center font-mono text-sm font-bold border border-r-0 last:border-r last:rounded-r-md focus:outline-none focus:ring-2 focus:ring-primary-500 focus:z-10 transition-colors ${
+              isCorrect
+                ? 'bg-green-100 border-green-500 text-green-900'
+                : isWrong
+                ? 'bg-red-50 border-red-400 text-red-800'
+                : ch
+                ? 'bg-primary-50 border-primary-400 text-primary-900'
+                : 'bg-white border-slate-300 text-slate-800'
+            }`}
+          />
+        ))}
+      </span>
+
+      {isWrong && (
+        <span className="ml-1.5 text-xs font-mono font-bold text-green-800 bg-green-100 px-1.5 py-0.5 rounded">
+          ✓ {blank.fullWord}
+        </span>
+      )}
+    </span>
+  );
+}
 
 export function InteractiveReadingBlock({
   block,
@@ -23,7 +139,7 @@ export function InteractiveReadingBlock({
 
   const [questions, setQuestions] = useState<QuestionBankItem[]>([]);
   const [mode, setMode] = useState<'interactive-reading' | 'read-and-complete'>(
-    forcedMode ?? 'interactive-reading'
+    forcedMode ?? 'read-and-complete'
   );
   const [currentIdx, setCurrentIdx] = useState(0);
 
@@ -40,20 +156,27 @@ export function InteractiveReadingBlock({
   // Read and Complete (C-Test) states
   const [prefixInputs, setPrefixInputs] = useState<Record<string, string>>({});
   const [submittedCloze, setSubmittedCloze] = useState(false);
+  const [lastClozeScore, setLastClozeScore] = useState<{
+    earned: number;
+    total: number;
+    detScore: number;
+  } | null>(null);
 
   useEffect(() => {
     if (forcedMode) setMode(forcedMode);
   }, [forcedMode]);
 
   useEffect(() => {
-    db.questionBank.toArray().then((all) => {
-      const readingItems = all.filter(
-        (q) =>
-          q.skill === 'reading' &&
-          (q.type === 'interactive-reading' || q.type === 'read-and-complete')
-      );
-      setQuestions(readingItems);
-    });
+    ensureDatabaseUpgraded()
+      .then(() => db.questionBank.toArray())
+      .then((all) => {
+        const readingItems = all.filter(
+          (q) =>
+            q.skill === 'reading' &&
+            (q.type === 'interactive-reading' || q.type === 'read-and-complete')
+        );
+        setQuestions(readingItems);
+      });
   }, []);
 
   const filteredList = useMemo(
@@ -76,6 +199,7 @@ export function InteractiveReadingBlock({
     setSubmittedReading(false);
     setPrefixInputs({});
     setSubmittedCloze(false);
+    setLastClozeScore(null);
   };
 
   const handleSwitchPassage = (nextIndex: number) => {
@@ -83,11 +207,10 @@ export function InteractiveReadingBlock({
     resetStates();
   };
 
-  // Grade 6-step Interactive Reading and save DET 0-160 score
   const handleGradeInteractiveReading = () => {
     if (!ir || !activeItem) return;
     let earned = 0;
-    let totalPossible = ir.blanks.length + 5;
+    const totalPossible = ir.blanks.length + 5;
     const wrongDetails: string[] = [];
     const rightDetails: string[] = [];
 
@@ -95,7 +218,9 @@ export function InteractiveReadingBlock({
       if (clozeAnswers[b.id] === b.correctAnswer) {
         earned += 1;
       } else {
-        wrongDetails.push(`Blank [${b.id}]: chose "${clozeAnswers[b.id] || 'none'}" (Correct: "${b.correctAnswer}")`);
+        wrongDetails.push(
+          `Blank [${b.id}]: chose "${clozeAnswers[b.id] || 'none'}" (Correct: "${b.correctAnswer}")`
+        );
       }
     }
     if (earned === ir.blanks.length) {
@@ -143,7 +268,9 @@ export function InteractiveReadingBlock({
     const summaryTranscript = [
       `[Interactive Reading — ${ir.sourceName}]`,
       `Accuracy: ${earned}/${totalPossible} (${Math.round(accuracy * 100)}%) -> Estimated DET Band: ${detScore}/160`,
-      wrongDetails.length > 0 ? `Mistakes: ${wrongDetails.join(' | ')}` : 'Zero errors across all 6 steps!',
+      wrongDetails.length > 0
+        ? `Mistakes: ${wrongDetails.join(' | ')}`
+        : 'Zero errors across all 6 steps!',
     ].join('\n');
 
     updateResponse(block.id, {
@@ -165,7 +292,8 @@ export function InteractiveReadingBlock({
           reading_accuracy: `${earned} / ${totalPossible} items correct`,
           source: ir.sourceName,
         },
-        strengths: rightDetails.length > 0 ? rightDetails : ['Completed interactive reading passage'],
+        strengths:
+          rightDetails.length > 0 ? rightDetails : ['Completed interactive reading passage'],
         weaknesses: wrongDetails,
         suggestions: [
           'Pay close attention to discourse markers (however, consequently, whereas) when bridging paragraphs.',
@@ -174,7 +302,6 @@ export function InteractiveReadingBlock({
     });
   };
 
-  // Grade Read and Complete (C-Test)
   const handleGradeReadAndComplete = () => {
     if (!rc || !activeItem) return;
     let earned = 0;
@@ -193,9 +320,12 @@ export function InteractiveReadingBlock({
     const accuracy = earned / Math.max(1, total);
     const detScore = Math.round(70 + accuracy * 90);
     setSubmittedCloze(true);
+    setLastClozeScore({ earned, total, detScore });
 
     const summaryTranscript = `[Read and Complete — ${rc.sourceName}] Score: ${earned}/${total} (${detScore}/160). ${
-      missedWords.length > 0 ? 'Missed: ' + missedWords.join(', ') : 'All words completed accurately!'
+      missedWords.length > 0
+        ? 'Missed: ' + missedWords.join(', ')
+        : 'All words completed accurately!'
     }`;
 
     updateResponse(block.id, {
@@ -212,14 +342,18 @@ export function InteractiveReadingBlock({
         overallScore: detScore,
         subscores: { literacy: detScore, comprehension: detScore },
         criteria: { lexical_cloze: `${earned}/${total} correct` },
-        strengths: earned >= total - 2 ? ['Strong orthographic & collocation recall'] : ['Completed C-test passage'],
+        strengths:
+          earned >= total - 2
+            ? ['Strong orthographic & collocation recall']
+            : ['Completed C-test passage'],
         weaknesses: missedWords,
-        suggestions: ['Look at prepositions and grammatical suffixes (-tion, -ive, -ly) following each blank.'],
+        suggestions: [
+          'Look at grammatical suffixes (-tion, -ive, -ly) and exact letter box counts.',
+        ],
       },
     });
   };
 
-  // Render Paragraph 1 with embedded dropdowns for Step 0 (Complete the Sentences)
   const renderParagraphWithDropdowns = () => {
     if (!ir) return null;
     const parts = ir.paragraph1WithBlanks.split(/(\{\{\d+\}\})/g);
@@ -270,7 +404,6 @@ export function InteractiveReadingBlock({
     );
   };
 
-  // Render clickable sentences for Steps 2 & 3 (Highlight the Answer)
   const renderClickableSentences = (sentences: string[], isHighlightStep: boolean) => {
     const activeSelection = step === 2 ? highlighted1 : step === 3 ? highlighted2 : '';
     return (
@@ -303,24 +436,8 @@ export function InteractiveReadingBlock({
 
   return (
     <div className="space-y-4">
-      {/* Top Mode & Passage Selector Bar */}
       <div className="bg-white border border-slate-200 rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-2xs">
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              setMode('interactive-reading');
-              setCurrentIdx(0);
-              resetStates();
-            }}
-            className={`px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer transition-colors ${
-              mode === 'interactive-reading'
-                ? 'bg-primary-600 text-white'
-                : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-            }`}
-          >
-            📖 Interactive Reading (6-Step Suite)
-          </button>
           <button
             type="button"
             onClick={() => {
@@ -334,7 +451,22 @@ export function InteractiveReadingBlock({
                 : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
             }`}
           >
-            ✍️ Read and Complete (C-Test Prefix Cloze)
+            ✍️ Read and Complete ({questions.filter((q) => q.type === 'read-and-complete').length} Passages)
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setMode('interactive-reading');
+              setCurrentIdx(0);
+              resetStates();
+            }}
+            className={`px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer transition-colors ${
+              mode === 'interactive-reading'
+                ? 'bg-primary-600 text-white'
+                : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+            }`}
+          >
+            📖 Interactive Reading ({questions.filter((q) => q.type === 'interactive-reading').length} Suites)
           </button>
         </div>
 
@@ -349,26 +481,85 @@ export function InteractiveReadingBlock({
             >
               ← Prev
             </button>
-            <span className="text-xs font-mono font-bold text-slate-600">
-              Passage {currentIdx + 1} / {filteredList.length}
+            <span className="text-xs font-mono font-bold text-slate-700">
+              Passage {currentIdx + 1} of {filteredList.length}
             </span>
             <button
               type="button"
               onClick={() => handleSwitchPassage((currentIdx + 1) % filteredList.length)}
               className="px-2.5 py-1 text-xs font-semibold border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
             >
-              Next Passage →
+              Next →
             </button>
           </div>
         )}
       </div>
 
-      {/* =================================================================== */}
-      {/* MODE 1: 6-STEP INTERACTIVE READING                                  */}
-      {/* =================================================================== */}
+      {mode === 'read-and-complete' && rc && (
+        <div className="bg-white border-2 border-slate-200 rounded-2xl p-6 space-y-5 shadow-xs">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+            <div>
+              <span className="text-xs font-bold uppercase tracking-wider text-accent-700 bg-accent-50 px-2.5 py-1 rounded">
+                Type the missing letters • Source: {rc.sourceName}
+              </span>
+              <h3 className="text-lg font-bold text-slate-900 mt-1.5">{rc.title}</h3>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {lastClozeScore && (
+                <span className="text-xs font-bold bg-green-100 text-green-800 border border-green-300 px-3 py-1.5 rounded-lg">
+                  Score: {lastClozeScore.earned}/{lastClozeScore.total} • Band {lastClozeScore.detScore}/160
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={handleGradeReadAndComplete}
+                className="px-4 py-2 bg-primary-600 text-white text-xs font-bold rounded-lg hover:bg-primary-700 cursor-pointer shadow-2xs"
+              >
+                ✓ Check Answers
+              </button>
+              {submittedCloze && filteredList.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => handleSwitchPassage((currentIdx + 1) % filteredList.length)}
+                  className="px-4 py-2 bg-slate-900 text-white text-xs font-bold rounded-lg hover:bg-slate-800 cursor-pointer"
+                >
+                  Next Paragraph ({((currentIdx + 1) % filteredList.length) + 1}/{filteredList.length}) →
+                </button>
+              )}
+            </div>
+          </div>
+
+          <p className="text-xs text-slate-500">
+            Each small box represents <strong>one missing letter</strong>. Typing a letter automatically moves to the next box (use Backspace to go back):
+          </p>
+
+          <div className="text-base text-slate-800 leading-10 bg-slate-50 p-6 rounded-xl border border-slate-200">
+            {rc.passageWithBlanks.split(/(\{\{\d+\}\})/g).map((part, idx) => {
+              const match = part.match(/^\{\{(\d+)\}\}$/);
+              if (!match) return <span key={idx}>{part}</span>;
+              const bId = match[1];
+              const blank = rc.blanks.find((b) => b.id === bId);
+              if (!blank) return <span key={idx}>{part}</span>;
+
+              return (
+                <SegmentedWordBlank
+                  key={bId}
+                  blank={blank}
+                  value={prefixInputs[bId] ?? ''}
+                  submitted={submittedCloze}
+                  onChange={(newVal) =>
+                    setPrefixInputs((prev) => ({ ...prev, [bId]: newVal }))
+                  }
+                />
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {mode === 'interactive-reading' && ir && (
         <div className="space-y-4">
-          {/* 6-Step Progress Pills */}
           <div className="flex flex-wrap gap-1.5">
             {STEP_LABELS.map((label, idx) => (
               <button
@@ -386,9 +577,7 @@ export function InteractiveReadingBlock({
             ))}
           </div>
 
-          {/* Split-Screen DET Reading Layout */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-            {/* LEFT PANE: Source Passage */}
             <div className="lg:col-span-7 bg-white border-2 border-slate-200 rounded-2xl p-5 space-y-4 shadow-xs">
               <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
                 <span className="text-xs font-bold uppercase tracking-wider text-primary-700 bg-primary-50 px-2.5 py-1 rounded">
@@ -401,12 +590,10 @@ export function InteractiveReadingBlock({
                 )}
               </div>
 
-              {/* Paragraph 1 */}
               {step === 0
                 ? renderParagraphWithDropdowns()
                 : renderClickableSentences(ir.paragraph1Sentences, step === 2 || step === 3)}
 
-              {/* Bridge Sentence Slot (Revealed from Step 1 onwards) */}
               {step >= 1 && (
                 <div
                   className={`p-3 rounded-xl border-2 text-sm font-medium transition-all ${
@@ -424,12 +611,10 @@ export function InteractiveReadingBlock({
                 </div>
               )}
 
-              {/* Paragraph 2 (Revealed from Step 1 onwards) */}
               {step >= 1 &&
                 renderClickableSentences(ir.paragraph2Sentences, step === 2 || step === 3)}
             </div>
 
-            {/* RIGHT PANE: Active Task Controls */}
             <div className="lg:col-span-5 bg-white border border-slate-200 rounded-2xl p-5 flex flex-col justify-between space-y-4 shadow-xs">
               <div className="space-y-4">
                 <span className="text-xs font-bold uppercase tracking-wider text-accent-700 bg-accent-50 px-2.5 py-1 rounded">
@@ -441,9 +626,6 @@ export function InteractiveReadingBlock({
                     <h4 className="text-sm font-bold text-slate-900">
                       Select the best word for each blank in the passage on the left.
                     </h4>
-                    <p className="text-xs text-slate-500">
-                      Focus on academic collocations, cohesive transitions, and grammatical precision.
-                    </p>
                     <div className="space-y-2 pt-2">
                       {ir.blanks.map((b) => (
                         <div
@@ -595,7 +777,6 @@ export function InteractiveReadingBlock({
                 )}
               </div>
 
-              {/* Step Navigation & Grade Button */}
               <div className="pt-4 border-t border-slate-100 flex items-center justify-between">
                 <button
                   type="button"
@@ -624,78 +805,6 @@ export function InteractiveReadingBlock({
                 )}
               </div>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* =================================================================== */}
-      {/* MODE 2: READ AND COMPLETE (C-TEST PREFIX COMPLETION)                */}
-      {/* =================================================================== */}
-      {mode === 'read-and-complete' && rc && (
-        <div className="bg-white border-2 border-slate-200 rounded-2xl p-6 space-y-5 shadow-xs">
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
-            <div>
-              <span className="text-xs font-bold uppercase tracking-wider text-accent-700 bg-accent-50 px-2.5 py-1 rounded">
-                Read and Complete • Source: {rc.sourceName}
-              </span>
-              <h3 className="text-base font-bold text-slate-900 mt-1">{rc.title}</h3>
-            </div>
-            <button
-              type="button"
-              onClick={handleGradeReadAndComplete}
-              className="px-4 py-2 bg-primary-600 text-white text-xs font-bold rounded-lg hover:bg-primary-700 cursor-pointer"
-            >
-              ✓ Check Completed Words
-            </button>
-          </div>
-
-          <p className="text-xs text-slate-500">
-            Type the missing letters to complete each unfinished word in the passage below:
-          </p>
-
-          <div className="text-base text-slate-800 leading-10 bg-slate-50 p-5 rounded-xl border border-slate-200">
-            {rc.passageWithBlanks.split(/(\{\{\d+\}\})/g).map((part, idx) => {
-              const match = part.match(/^\{\{(\d+)\}\}$/);
-              if (!match) return <span key={idx}>{part}</span>;
-              const bId = match[1];
-              const blank = rc.blanks.find((b) => b.id === bId);
-              if (!blank) return <span key={idx}>{part}</span>;
-              const typed = prefixInputs[bId] ?? '';
-              const isCorrect =
-                submittedCloze && typed.trim().toLowerCase() === blank.missingSuffix.toLowerCase();
-              const isWrong =
-                submittedCloze && typed.trim().toLowerCase() !== blank.missingSuffix.toLowerCase();
-
-              return (
-                <span
-                  key={idx}
-                  className="inline-flex items-baseline mx-1 bg-white px-2 py-0.5 rounded-lg border border-slate-300 shadow-2xs"
-                >
-                  <span className="font-bold text-slate-900 font-mono">{blank.prefix}</span>
-                  <input
-                    type="text"
-                    value={typed}
-                    onChange={(e) =>
-                      setPrefixInputs((prev) => ({ ...prev, [bId]: e.target.value }))
-                    }
-                    style={{ width: `${Math.max(4, blank.missingSuffix.length + 1)}ch` }}
-                    placeholder={'_'.repeat(blank.missingSuffix.length)}
-                    className={`font-mono text-sm font-bold border-b-2 focus:outline-none px-0.5 ${
-                      isCorrect
-                        ? 'border-green-600 text-green-700 bg-green-50'
-                        : isWrong
-                        ? 'border-red-600 text-red-700 bg-red-50'
-                        : 'border-primary-500 text-primary-700'
-                    }`}
-                  />
-                  {isWrong && (
-                    <span className="ml-1 text-xs font-mono font-bold text-green-700">
-                      ({blank.fullWord})
-                    </span>
-                  )}
-                </span>
-              );
-            })}
           </div>
         </div>
       )}

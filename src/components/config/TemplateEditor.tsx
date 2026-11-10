@@ -1,327 +1,278 @@
-import { useState } from 'react'
-import { useConfigStore } from '../../stores/configStore'
-import type { SessionTemplate, Block, BlockType } from '../../types'
-import { generateId } from '../../utils/helpers'
+import { useEffect } from 'react';
+import { useConfigStore } from '../../stores/configStore';
+import { ensureDatabaseUpgraded } from '../../db/database';
+import type { Block, BlockType } from '../../types';
+import { formatTime, generateId } from '../../utils/helpers';
 
-/**
- * TemplateEditor — CRUD interface for session templates.
- * Supports creating, editing, deleting, reordering blocks within templates.
- */
+const BLOCK_TYPE_OPTIONS: { value: BlockType; label: string }[] = [
+  { value: 'interactive-reading', label: '📖 Interactive Reading & Read/Complete' },
+  { value: 'shadowing', label: '🗣️ Arguelles Shadowing (TED / Human Audio)' },
+  { value: 'dictogloss', label: '🎧 Dictogloss Working-Memory Reconstruction' },
+  { value: 'vocab-writing', label: '🧩 Collocation Chunk Writing (SRS)' },
+  { value: 'speaking', label: '🎙️ Timed Verbatim Speaking' },
+  { value: 'brain-dump', label: '📝 Brain Dump & Structural Outline' },
+  { value: 'mock-test', label: '🎯 Timed Adaptive Mock Test' },
+  { value: 'custom', label: '⚙️ Custom Block' },
+];
+
 export function TemplateEditor() {
-  const templates = useConfigStore((s) => s.templates)
-  const saveTemplate = useConfigStore((s) => s.saveTemplate)
-  const deleteTemplate = useConfigStore((s) => s.deleteTemplate)
-  const [editingTemplate, setEditingTemplate] = useState<SessionTemplate | null>(null)
+  const templates = useConfigStore((s) => s.templates);
+  const loadTemplates = useConfigStore((s) => s.loadTemplates);
+  const evalPrompts = useConfigStore((s) => s.evalPrompts);
+  const editingTemplate = useConfigStore((s) => s.editingTemplate);
+  const setEditingTemplate = useConfigStore((s) => s.setEditingTemplate);
+  const createTemplate = useConfigStore((s) => s.createTemplate);
+  const saveTemplate = useConfigStore((s) => s.saveTemplate);
+  const deleteTemplate = useConfigStore((s) => s.deleteTemplate);
+  const duplicateTemplate = useConfigStore((s) => s.duplicateTemplate);
 
-  const blockTypes: { value: BlockType; label: string }[] = [
-    { value: 'brain-dump', label: '🧠 Brain Dump' },
-    { value: 'vocab-writing', label: '✍️ Vocab & Writing' },
-    { value: 'speaking', label: '🎤 Speaking' },
-    { value: 'mock-test', label: '📝 Mock Test' },
-    { value: 'custom', label: '🔧 Custom' },
-  ]
+  useEffect(() => {
+    void ensureDatabaseUpgraded().then(() => loadTemplates());
+  }, [loadTemplates]);
 
-  const handleNew = () => {
-    const newTemplate: SessionTemplate = {
-      id: generateId(),
-      name: 'New Session',
-      blocks: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    }
-    setEditingTemplate(newTemplate)
-  }
-
-  const handleEdit = (template: SessionTemplate) => {
-    setEditingTemplate({ ...template, blocks: [...template.blocks] })
-  }
-
-  const handleSave = async () => {
-    if (!editingTemplate) return
-    await saveTemplate({
-      ...editingTemplate,
-      updatedAt: new Date().toISOString(),
-    })
-    setEditingTemplate(null)
-  }
-
-  const handleCancel = () => {
-    setEditingTemplate(null)
-  }
-
-  const addBlock = () => {
-    if (!editingTemplate) return
+  const handleAddBlock = () => {
+    if (!editingTemplate) return;
+    const defaultEval = evalPrompts[0]?.id ?? '';
     const newBlock: Block = {
       id: generateId(),
-      name: 'New Block',
-      type: 'brain-dump',
-      durationSec: 300,
-      instructions: '',
-      autoAdvance: true,
-      evalPromptId: '',
-    }
+      name: `Block ${editingTemplate.blocks.length + 1}`,
+      type: 'interactive-reading',
+      durationSec: 5 * 60,
+      instructions: 'Complete the task below under timed conditions.',
+      autoAdvance: false,
+      evalPromptId: defaultEval,
+    };
     setEditingTemplate({
       ...editingTemplate,
       blocks: [...editingTemplate.blocks, newBlock],
-    })
-  }
+    });
+  };
 
-  const updateBlock = (index: number, updates: Partial<Block>) => {
-    if (!editingTemplate) return
-    const blocks = [...editingTemplate.blocks]
-    blocks[index] = { ...blocks[index], ...updates }
-    setEditingTemplate({ ...editingTemplate, blocks })
-  }
+  const handleUpdateBlock = (index: number, patch: Partial<Block>) => {
+    if (!editingTemplate) return;
+    const nextBlocks = editingTemplate.blocks.map((b, i) =>
+      i === index ? { ...b, ...patch } : b
+    );
+    setEditingTemplate({ ...editingTemplate, blocks: nextBlocks });
+  };
 
-  const removeBlock = (index: number) => {
-    if (!editingTemplate) return
-    const blocks = editingTemplate.blocks.filter((_, i) => i !== index)
-    setEditingTemplate({ ...editingTemplate, blocks })
-  }
-
-  const moveBlock = (index: number, direction: 'up' | 'down') => {
-    if (!editingTemplate) return
-    const blocks = [...editingTemplate.blocks]
-    const swapIdx = direction === 'up' ? index - 1 : index + 1
-    if (swapIdx < 0 || swapIdx >= blocks.length) return
-    ;[blocks[index], blocks[swapIdx]] = [blocks[swapIdx], blocks[index]]
-    setEditingTemplate({ ...editingTemplate, blocks })
-  }
-
-  const totalDuration = editingTemplate?.blocks.reduce((sum, b) => sum + b.durationSec, 0) ?? 0
-
-  // Active (non-deleted) templates
-  const activeTemplates = templates.filter((t) => !t.deletedAt)
+  const handleRemoveBlock = (index: number) => {
+    if (!editingTemplate) return;
+    setEditingTemplate({
+      ...editingTemplate,
+      blocks: editingTemplate.blocks.filter((_, i) => i !== index),
+    });
+  };
 
   return (
-    <div>
-      <div className="flex items-center justify-between mb-6">
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
         <div>
           <h2 className="text-xl font-bold text-slate-900">Session Templates</h2>
-          <p className="text-sm text-slate-500 mt-1">
-            Create and manage your practice session configurations
+          <p className="text-sm text-slate-500 mt-0.5">
+            Build custom practice routines combining Reading, Shadowing, Dictogloss, Writing, and Speaking blocks.
           </p>
         </div>
         <button
-          onClick={handleNew}
-          className="px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 transition-colors"
+          onClick={createTemplate}
+          className="px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 cursor-pointer"
         >
           + New Template
         </button>
       </div>
 
-      {/* Template List */}
       {!editingTemplate && (
         <div className="space-y-3">
-          {activeTemplates.length === 0 && (
-            <div className="text-center py-12 text-slate-400">
-              <p className="text-lg">No templates yet</p>
-              <p className="text-sm mt-1">Create your first session template to get started</p>
-            </div>
-          )}
-          {activeTemplates.map((template) => (
-            <div
-              key={template.id}
-              className="bg-white rounded-lg border border-slate-200 p-4 hover:border-primary-300 transition-colors"
-            >
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="font-semibold text-slate-900">{template.name}</h3>
-                  <p className="text-sm text-slate-500 mt-0.5">
-                    {template.blocks.length} blocks •{' '}
-                    {Math.ceil(template.blocks.reduce((s, b) => s + b.durationSec, 0) / 60)} min total
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => handleEdit(template)}
-                    className="px-3 py-1.5 text-sm text-primary-600 hover:bg-primary-50 rounded-md transition-colors"
-                  >
-                    Edit
-                  </button>
-                  <button
-                    onClick={() => deleteTemplate(template.id)}
-                    className="px-3 py-1.5 text-sm text-danger-500 hover:bg-red-50 rounded-md transition-colors"
-                  >
-                    Delete
-                  </button>
-                </div>
-              </div>
-              {/* Block preview */}
-              <div className="flex gap-1.5 mt-3">
-                {template.blocks.map((block) => (
-                  <div
-                    key={block.id}
-                    className="flex-1 bg-slate-100 rounded px-2 py-1 text-xs text-slate-600 text-center truncate"
-                    title={`${block.name} (${Math.ceil(block.durationSec / 60)}m)`}
-                  >
-                    {block.name}
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Template Editor */}
-      {editingTemplate && (
-        <div className="bg-white rounded-lg border border-slate-200 p-6">
-          <div className="flex items-center justify-between mb-5 pb-3 border-b border-slate-100">
-            <button
-              type="button"
-              onClick={handleCancel}
-              className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
-            >
-              ← Back to Templates List
-            </button>
-            <span className="text-xs text-slate-400">Editing Template Configuration</span>
-          </div>
-
-          {/* Template name */}
-          <div className="mb-6">
-            <label className="block text-sm font-medium text-slate-700 mb-1">Template Name</label>
-            <input
-              type="text"
-              value={editingTemplate.name}
-              onChange={(e) => setEditingTemplate({ ...editingTemplate, name: e.target.value })}
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
-              placeholder="e.g., Full Mock Session"
-            />
-          </div>
-
-          {/* Blocks */}
-          <div className="mb-4">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="font-semibold text-slate-900">
-                Blocks ({editingTemplate.blocks.length})
-              </h3>
-              <span className="text-sm text-slate-500">
-                Total: {Math.floor(totalDuration / 60)}:{String(totalDuration % 60).padStart(2, '0')}
-              </span>
-            </div>
-
-            <div className="space-y-3">
-              {editingTemplate.blocks.map((block, index) => (
-                <div
-                  key={block.id}
-                  className="border border-slate-200 rounded-lg p-4 bg-slate-50"
-                >
-                  <div className="flex items-start gap-3">
-                    {/* Reorder buttons */}
-                    <div className="flex flex-col gap-1 pt-1">
-                      <button
-                        onClick={() => moveBlock(index, 'up')}
-                        disabled={index === 0}
-                        className="text-slate-400 hover:text-slate-600 disabled:opacity-30"
-                      >
-                        ▲
-                      </button>
-                      <button
-                        onClick={() => moveBlock(index, 'down')}
-                        disabled={index === editingTemplate.blocks.length - 1}
-                        className="text-slate-400 hover:text-slate-600 disabled:opacity-30"
-                      >
-                        ▼
-                      </button>
-                    </div>
-
-                    {/* Block fields */}
-                    <div className="flex-1 grid grid-cols-3 gap-3">
-                      <div>
-                        <label className="block text-xs font-medium text-slate-500 mb-1">Name</label>
-                        <input
-                          type="text"
-                          value={block.name}
-                          onChange={(e) => updateBlock(index, { name: e.target.value })}
-                          className="w-full px-2 py-1.5 border border-slate-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-medium text-slate-500 mb-1">Type</label>
-                        <select
-                          value={block.type}
-                          onChange={(e) => updateBlock(index, { type: e.target.value as BlockType })}
-                          className="w-full px-2 py-1.5 border border-slate-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+          {templates.map((t) => {
+            const totalDuration = t.blocks.reduce((sum, b) => sum + b.durationSec, 0);
+            return (
+              <div
+                key={t.id}
+                className="bg-white rounded-xl border border-slate-200 p-5 hover:border-primary-300 transition-colors"
+              >
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h3 className="font-bold text-slate-900">{t.name}</h3>
+                    {t.description && (
+                      <p className="text-xs text-slate-500 mt-0.5">{t.description}</p>
+                    )}
+                    <div className="flex flex-wrap items-center gap-2 mt-3">
+                      <span className="text-xs font-mono text-slate-500">
+                        Total: {formatTime(totalDuration)}
+                      </span>
+                      {t.blocks.map((b, idx) => (
+                        <span
+                          key={b.id}
+                          className="text-xs bg-slate-100 text-slate-700 px-2.5 py-0.5 rounded-full font-medium"
                         >
-                          {blockTypes.map((bt) => (
-                            <option key={bt.value} value={bt.value}>
-                              {bt.label}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-xs font-medium text-slate-500 mb-1">
-                          Duration (min)
-                        </label>
-                        <input
-                          type="number"
-                          min={1}
-                          value={Math.ceil(block.durationSec / 60)}
-                          onChange={(e) =>
-                            updateBlock(index, { durationSec: Number(e.target.value) * 60 })
-                          }
-                          className="w-full px-2 py-1.5 border border-slate-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
-                        />
-                      </div>
-                      <div className="col-span-2">
-                        <label className="block text-xs font-medium text-slate-500 mb-1">
-                          Instructions
-                        </label>
-                        <textarea
-                          value={block.instructions}
-                          onChange={(e) => updateBlock(index, { instructions: e.target.value })}
-                          rows={2}
-                          className="w-full px-2 py-1.5 border border-slate-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none"
-                          placeholder="Instructions shown to the student..."
-                        />
-                      </div>
-                      <div className="flex items-end">
-                        <label className="flex items-center gap-2 text-sm text-slate-600">
-                          <input
-                            type="checkbox"
-                            checked={block.autoAdvance}
-                            onChange={(e) => updateBlock(index, { autoAdvance: e.target.checked })}
-                            className="rounded border-slate-300 text-primary-600 focus:ring-primary-500"
-                          />
-                          Auto-advance
-                        </label>
-                      </div>
+                          {idx + 1}. {b.name} ({Math.round(b.durationSec / 60)}m)
+                        </span>
+                      ))}
                     </div>
-
-                    {/* Remove button */}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
                     <button
-                      onClick={() => removeBlock(index)}
-                      className="text-slate-400 hover:text-danger-500 transition-colors mt-1"
-                      title="Remove block"
+                      onClick={() => setEditingTemplate({ ...t })}
+                      className="px-3 py-1.5 text-xs font-semibold text-primary-700 bg-primary-50 rounded-lg hover:bg-primary-100 cursor-pointer"
                     >
-                      ✕
+                      Edit
+                    </button>
+                    <button
+                      onClick={() => duplicateTemplate(t.id)}
+                      className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 cursor-pointer"
+                    >
+                      Duplicate
+                    </button>
+                    <button
+                      onClick={() => deleteTemplate(t.id)}
+                      className="px-2.5 py-1.5 text-xs text-red-600 hover:bg-red-50 rounded-lg cursor-pointer"
+                    >
+                      Delete
                     </button>
                   </div>
                 </div>
-              ))}
-            </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
-            <button
-              onClick={addBlock}
-              className="mt-3 w-full py-2.5 border-2 border-dashed border-slate-300 rounded-lg text-sm text-slate-500 hover:border-primary-400 hover:text-primary-600 transition-colors"
-            >
-              + Add Block
-            </button>
+      {editingTemplate && (
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-5">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-bold text-slate-700 mb-1">
+                Template Name
+              </label>
+              <input
+                type="text"
+                value={editingTemplate.name}
+                onChange={(e) =>
+                  setEditingTemplate({ ...editingTemplate, name: e.target.value })
+                }
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-700 mb-1">
+                Description
+              </label>
+              <input
+                type="text"
+                value={editingTemplate.description ?? ''}
+                onChange={(e) =>
+                  setEditingTemplate({
+                    ...editingTemplate,
+                    description: e.target.value,
+                  })
+                }
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+              />
+            </div>
           </div>
 
-          {/* Actions */}
-          <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200">
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                Blocks ({editingTemplate.blocks.length})
+              </h4>
+              <button
+                type="button"
+                onClick={handleAddBlock}
+                className="px-3 py-1.5 bg-accent-600 text-white text-xs font-bold rounded-lg hover:bg-accent-700 cursor-pointer"
+              >
+                + Add Block
+              </button>
+            </div>
+
+            {editingTemplate.blocks.map((b, i) => (
+              <div
+                key={b.id}
+                className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3"
+              >
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                  <div className="md:col-span-2">
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                      Block Name
+                    </label>
+                    <input
+                      type="text"
+                      value={b.name}
+                      onChange={(e) => handleUpdateBlock(i, { name: e.target.value })}
+                      className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                      Block Type
+                    </label>
+                    <select
+                      value={b.type}
+                      onChange={(e) =>
+                        handleUpdateBlock(i, { type: e.target.value as BlockType })
+                      }
+                      className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded text-xs"
+                    >
+                      {BLOCK_TYPE_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                      Duration (Minutes)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={60}
+                      value={Math.max(1, Math.round(b.durationSec / 60))}
+                      onChange={(e) =>
+                        handleUpdateBlock(i, {
+                          durationSec: Math.max(1, Number(e.target.value)) * 60,
+                        })
+                      }
+                      className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded text-xs font-mono"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between gap-3">
+                  <input
+                    type="text"
+                    value={b.instructions}
+                    onChange={(e) =>
+                      handleUpdateBlock(i, { instructions: e.target.value })
+                    }
+                    placeholder="Instructions for this block..."
+                    className="flex-1 px-2.5 py-1.5 bg-white border border-slate-300 rounded text-xs"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveBlock(i)}
+                    className="px-2.5 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 rounded cursor-pointer"
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex justify-end gap-3 pt-3 border-t border-slate-100">
             <button
-              onClick={handleCancel}
-              className="px-4 py-2 text-sm text-slate-600 hover:text-slate-900 transition-colors"
+              type="button"
+              onClick={() => setEditingTemplate(null)}
+              className="px-4 py-2 text-sm text-slate-600 cursor-pointer"
             >
               Cancel
             </button>
             <button
-              onClick={handleSave}
-              className="px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 transition-colors"
+              type="button"
+              onClick={() => saveTemplate(editingTemplate)}
+              className="px-5 py-2 bg-primary-600 text-white text-sm font-bold rounded-lg hover:bg-primary-700 cursor-pointer"
             >
               Save Template
             </button>
@@ -329,6 +280,5 @@ export function TemplateEditor() {
         </div>
       )}
     </div>
-  )
+  );
 }
-

@@ -6,6 +6,8 @@ import { db } from '../../../db/database';
 import type { BlockConfig, QuestionBankItem } from '../../../types';
 import { WhisperLiveIndicator } from '../../common/WhisperLiveIndicator';
 
+const BACKEND_BASE = 'http://127.0.0.1:8000';
+
 function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -38,6 +40,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
   const [speechRate, setSpeechRate] = useState<number>(1.0);
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
   const [hideTranscript, setHideTranscript] = useState(false);
+  const [downloadingYt, setDownloadingYt] = useState(false);
   const [recordingState, setRecordingState] = useState<'idle' | 'recording' | 'transcribing' | 'done'>('idle');
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -49,35 +52,69 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
 
   const response = draftResponses[block.id];
 
+  const loadShadowingPassages = useCallback(async () => {
+    const all = await db.questionBank.toArray();
+    let manifest: Record<string, { audioUrl: string; text: string }> = {};
+    try {
+      const res = await fetch(`${BACKEND_BASE}/audio/manifest`);
+      if (res.ok) {
+        manifest = (await res.json()) as Record<string, { audioUrl: string; text: string }>;
+      }
+    } catch {
+      // Backend offline or manifest empty
+    }
+
+    const updatedItems: QuestionBankItem[] = [];
+    for (const q of all) {
+      if (q.youtubeSource?.clipKey && manifest[q.youtubeSource.clipKey] && !q.audioUrl) {
+        const cached = manifest[q.youtubeSource.clipKey];
+        const upgraded: QuestionBankItem = {
+          ...q,
+          audioUrl: cached.audioUrl,
+          sourceAudioText: cached.text || q.sourceAudioText,
+          prompt: cached.text || q.prompt,
+        };
+        await db.questionBank.put(upgraded);
+        updatedItems.push(upgraded);
+      } else {
+        updatedItems.push(q);
+      }
+    }
+
+    const shadowItems = updatedItems.filter(
+      (q) =>
+        Boolean(q.audioUrl) ||
+        Boolean(q.youtubeSource) ||
+        q.tags.includes('shadowing') ||
+        q.type === 'read-aloud' ||
+        Boolean(q.sourceAudioText)
+    );
+    shadowItems.sort(
+      (a, b) =>
+        (b.audioUrl ? 2 : b.youtubeSource ? 1 : 0) -
+        (a.audioUrl ? 2 : a.youtubeSource ? 1 : 0)
+    );
+    setPassages(shadowItems.length > 0 ? shadowItems : updatedItems);
+  }, []);
+
   useEffect(() => {
-    db.questionBank.toArray().then((all) => {
-      const shadowItems = all.filter(
-        (q) =>
-          Boolean(q.audioUrl) ||
-          q.tags.includes('shadowing') ||
-          q.type === 'read-aloud' ||
-          Boolean(q.sourceAudioText)
-      );
-      // Prioritize items with real human audio first
-      shadowItems.sort((a, b) => (b.audioUrl ? 1 : 0) - (a.audioUrl ? 1 : 0));
-      setPassages(shadowItems.length > 0 ? shadowItems : all);
-    });
+    void loadShadowingPassages();
     return () => {
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
       }
       if (recTimerRef.current) clearInterval(recTimerRef.current);
     };
-  }, []);
+  }, [loadShadowingPassages]);
 
   const currentItem = passages[selectedIdx];
   const humanAudioUrl = currentItem?.audioUrl?.trim() || '';
+  const ytSource = currentItem?.youtubeSource;
   const sourceText =
     currentItem?.sourceAudioText ||
     currentItem?.prompt ||
     'While automated static analysis accelerates vulnerability discovery across large codebases, human security critics remain indispensable for verifying complex business logic and preventing subtle authentication bypasses.';
 
-  // Sync playbackRate and pitch preservation on the HTML5 <audio> element
   useEffect(() => {
     const el = audioPlayerRef.current;
     if (!el) return;
@@ -86,6 +123,50 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
       (el as HTMLAudioElement & { preservesPitch?: boolean }).preservesPitch = true;
     }
   }, [speechRate, humanAudioUrl]);
+
+  const handleDownloadCuratedYoutube = async () => {
+    if (!currentItem || !ytSource) return;
+    setDownloadingYt(true);
+    setError(null);
+    try {
+      const res = await fetch(`${BACKEND_BASE}/audio/youtube`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: ytSource.url,
+          startTime: ytSource.startTime,
+          endTime: ytSource.endTime,
+          clipKey: ytSource.clipKey,
+        }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({ detail: 'Download failed' }));
+        throw new Error(errData.detail || 'yt-dlp download failed');
+      }
+      const data = (await res.json()) as {
+        audioUrl: string;
+        text: string;
+      };
+      const updatedItem: QuestionBankItem = {
+        ...currentItem,
+        audioUrl: data.audioUrl,
+        sourceAudioText: data.text || currentItem.sourceAudioText,
+        prompt: data.text || currentItem.prompt,
+      };
+      await db.questionBank.put(updatedItem);
+      setPassages((prev) =>
+        prev.map((p, idx) => (idx === selectedIdx ? updatedItem : p))
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Failed to download YouTube clip. Make sure python app.py is running and yt-dlp is installed.'
+      );
+    } finally {
+      setDownloadingYt(false);
+    }
+  };
 
   const playNativeAudio = useCallback(() => {
     if (humanAudioUrl && audioPlayerRef.current) {
@@ -196,12 +277,16 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
             className={`text-xs font-bold px-2.5 py-1 rounded-full ${
               humanAudioUrl
                 ? 'bg-green-100 text-green-800 border border-green-300'
+                : ytSource
+                ? 'bg-blue-100 text-blue-800 border border-blue-300'
                 : 'bg-amber-100 text-amber-800'
             }`}
           >
             {humanAudioUrl
-              ? '🎙️ Real Human Audio Active'
-              : '⚠️ Synthetic TTS Fallback (Add Human MP3 in Config -> Question Bank)'}
+              ? '🎙️ Real Human Audio Ready on Device'
+              : ytSource
+              ? `🎬 Curated YouTube Talk: ${ytSource.speaker}`
+              : '⚠️ Synthetic TTS Fallback'}
           </span>
         </div>
 
@@ -230,17 +315,41 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
               }}
               className="text-xs font-semibold text-primary-700 bg-primary-50 border border-primary-200 px-3 py-1 rounded-lg cursor-pointer"
             >
-              Next Clip ({selectedIdx + 1}/{passages.length})
+              Next Clip ({selectedIdx + 1}/{passages.length}) →
             </button>
           )}
         </div>
       </div>
 
-      {/* Real Human HTML5 Audio Player Bar */}
+      {!humanAudioUrl && ytSource && (
+        <div className="bg-accent-50 border-2 border-accent-300 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-bold uppercase tracking-wider text-accent-800">
+              🎬 Curated TED / Academic Talk Linked ({ytSource.speaker} • {ytSource.startTime}–{ytSource.endTime})
+            </p>
+            <p className="text-xs text-slate-600 mt-0.5">
+              Click once to auto-download this real human audio slice to your device and transcribe it with Faster-Whisper.
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={downloadingYt}
+            onClick={handleDownloadCuratedYoutube}
+            className="px-4 py-2 bg-accent-600 hover:bg-accent-700 text-white text-xs font-bold rounded-lg disabled:opacity-50 cursor-pointer shadow-xs"
+          >
+            {downloadingYt
+              ? '⏳ Downloading & Transcribing via GPU...'
+              : '⬇️ Auto-Download Human Audio to Device'}
+          </button>
+        </div>
+      )}
+
       {humanAudioUrl && (
         <div className="bg-slate-900 text-white rounded-xl p-4 space-y-2">
           <div className="flex items-center justify-between text-xs text-slate-300">
-            <span>Human Reference Track (Pitch-Preserved {speechRate}x) — Wear headphones while shadowing</span>
+            <span>
+              Human Reference Track ({currentItem?.sourceAttribution || 'Local MP3'} • Pitch-Preserved {speechRate}x)
+            </span>
             <button
               type="button"
               onClick={rewindFiveSeconds}
@@ -264,7 +373,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
       <div className="bg-primary-50 border border-primary-200 rounded-xl p-5 space-y-2">
         <div className="flex items-center justify-between">
           <span className="text-xs font-bold uppercase tracking-wider text-primary-700">
-            Arguelles Shadowing Script (Lag by ~0.5s, mirror human prosody & stress)
+            Arguelles Shadowing Script ({currentItem?.sourceAttribution || 'Academic Passage'})
           </span>
           <div className="flex items-center gap-2">
             <button

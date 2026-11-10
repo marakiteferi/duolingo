@@ -6,8 +6,8 @@ import type { BlockConfig, QuestionBankItem, DETQuestionType, DETSkill } from '.
 
 const QUESTION_TYPE_LABELS: { value: DETQuestionType | 'adaptive'; label: string }[] = [
   { value: 'adaptive', label: '🎯 Adaptive (Targets Weakest Skill)' },
-  { value: 'interactive-reading', label: '📖 Interactive Reading (BBC / The Conversation)' },
-  { value: 'read-and-complete', label: '✍️ Read & Complete (Prefix Cloze)' },
+  { value: 'read-and-complete', label: '✍️ Read & Complete (1-Letter-Per-Box Cloze)' },
+  { value: 'interactive-reading', label: '📖 Interactive Reading (6-Step Suite)' },
   { value: 'interactive-writing', label: '📝 Interactive Writing' },
   { value: 'write-about-photo', label: '🧩 Collocation Chunk Writing' },
   { value: 'listen-and-type', label: '🎧 Listen & Type / Dictogloss' },
@@ -24,9 +24,9 @@ export function MockTestBlock({ block }: { block: BlockConfig }) {
   const [selectedType, setSelectedType] = useState<DETQuestionType | 'adaptive'>(
     block.preferredQuestionType ??
       (activeRun?.preferredQuestionType === 'all'
-        ? 'interactive-reading'
+        ? 'read-and-complete'
         : activeRun?.preferredQuestionType) ??
-      'interactive-reading'
+      'read-and-complete'
   );
   const [questions, setQuestions] = useState<QuestionBankItem[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);

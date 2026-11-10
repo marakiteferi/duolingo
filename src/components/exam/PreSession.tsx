@@ -26,7 +26,8 @@ export function PreSession() {
   const [customDurations, setCustomDurations] = useState<Record<string, number>>({});
   const [instantFeedback, setInstantFeedback] = useState<boolean>(true);
   const [communicativePressure, setCommunicativePressure] = useState<boolean>(false);
-  const [preferredQuestionType, setPreferredQuestionType] = useState<DETQuestionType | 'all' | 'adaptive'>('adaptive');
+  const [preferredQuestionType, setPreferredQuestionType] =
+    useState<DETQuestionType | 'all' | 'adaptive'>('adaptive');
 
   const selectedTemplate = templates.find((t) => t.id === selectedTemplateId) ?? null;
 
@@ -62,7 +63,9 @@ export function PreSession() {
 
   const activeBlocks =
     selectedTemplate?.blocks.filter((b) => selectedBlockIds.includes(b.id)) ?? [];
-  const hasSpeakingBlock = activeBlocks.some((b) => b.type === 'speaking' || b.type === 'shadowing');
+  const hasSpeakingBlock = activeBlocks.some(
+    (b) => b.type === 'speaking' || b.type === 'shadowing'
+  );
   const totalSec = activeBlocks.reduce(
     (sum, b) => sum + (customDurations[b.id] ?? b.durationSec),
     0
@@ -118,7 +121,6 @@ export function PreSession() {
         <WhisperLiveIndicator />
       </div>
 
-      {/* SLA Priming: Recurring Error Log */}
       {recurringErrors.length > 0 && (
         <div className="mb-6 bg-amber-50 border-2 border-amber-200 rounded-xl p-4 space-y-2">
           <div className="flex items-center justify-between">
@@ -131,7 +133,10 @@ export function PreSession() {
           </div>
           <ul className="space-y-1.5">
             {recurringErrors.map((err, i) => (
-              <li key={i} className="text-xs text-slate-800 flex items-start justify-between gap-2 bg-white/80 p-2 rounded-lg border border-amber-100">
+              <li
+                key={i}
+                className="text-xs text-slate-800 flex items-start justify-between gap-2 bg-white/80 p-2 rounded-lg border border-amber-100"
+              >
                 <span>
                   <strong className="uppercase text-[10px] px-1.5 py-0.5 rounded bg-amber-200 text-amber-900 mr-2">
                     {err.category}
@@ -173,7 +178,6 @@ export function PreSession() {
         </div>
       )}
 
-      {/* 1. Template Picker */}
       <div className="mb-6">
         <label className="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">
           1. Select Practice Protocol / Template
@@ -198,16 +202,19 @@ export function PreSession() {
               <div className="flex-1">
                 <div className="flex items-center justify-between">
                   <p className="font-semibold text-slate-900">{t.name}</p>
-                  <span className="text-xs font-mono text-slate-500">{t.blocks.length} blocks</span>
+                  <span className="text-xs font-mono text-slate-500">
+                    {t.blocks.length} blocks
+                  </span>
                 </div>
-                {t.description && <p className="text-xs text-slate-500 mt-0.5">{t.description}</p>}
+                {t.description && (
+                  <p className="text-xs text-slate-500 mt-0.5">{t.description}</p>
+                )}
               </div>
             </label>
           ))}
         </div>
       </div>
 
-      {/* 2. Select Blocks */}
       {selectedTemplate && (
         <div className="mb-6 bg-white rounded-xl border border-slate-200 p-5">
           <div className="flex items-center justify-between mb-3">
@@ -221,7 +228,10 @@ export function PreSession() {
           <div className="space-y-2">
             {selectedTemplate.blocks.map((b, i) => {
               const checked = selectedBlockIds.includes(b.id);
-              const durMin = Math.max(1, Math.round((customDurations[b.id] ?? b.durationSec) / 60));
+              const durMin = Math.max(
+                1,
+                Math.round((customDurations[b.id] ?? b.durationSec) / 60)
+              );
               return (
                 <div
                   key={b.id}
@@ -265,7 +275,6 @@ export function PreSession() {
         </div>
       )}
 
-      {/* 3. Feedback Mode & Communicative Pressure */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
         <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3">
           <label className="block text-xs font-bold uppercase tracking-wider text-slate-500">
@@ -279,7 +288,9 @@ export function PreSession() {
               className="mt-1"
             />
             <div>
-              <p className="text-sm font-semibold text-slate-800">Instant Write-Critique-Rewrite Loop</p>
+              <p className="text-sm font-semibold text-slate-800">
+                Instant Write-Critique-Rewrite Loop
+              </p>
               <p className="text-xs text-slate-500">
                 Grade immediately & unlock the "Apply Fixes & Rewrite/Re-record" button.
               </p>
@@ -293,7 +304,9 @@ export function PreSession() {
               className="mt-1 accent-red-600"
             />
             <div>
-              <p className="text-sm font-bold text-red-700">Strict Communicative Pressure Mode</p>
+              <p className="text-sm font-bold text-red-700">
+                Strict Communicative Pressure Mode
+              </p>
               <p className="text-xs text-slate-500">
                 Disables Backspace/Delete in writing and hides Stop in speaking until timer ends.
               </p>
@@ -308,18 +321,22 @@ export function PreSession() {
           <select
             value={preferredQuestionType}
             onChange={(e) =>
-              setPreferredQuestionType(e.target.value as DETQuestionType | 'all' | 'adaptive')
+              setPreferredQuestionType(
+                e.target.value as DETQuestionType | 'all' | 'adaptive'
+              )
             }
             className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-medium text-slate-800 mb-2"
           >
             <option value="adaptive">Adaptive + SRS Due First (Recommended)</option>
             <option value="all">All Question Types</option>
-            <option value="interactive-writing">Interactive Writing Only</option>
-            <option value="write-about-photo">Write About Photo Only</option>
-            <option value="speaking-sample">Speaking Sample Only</option>
-            <option value="interactive-speaking">Interactive Speaking Only</option>
-            <option value="read-aloud">Read Aloud / Shadowing Only</option>
-            <option value="listen-and-type">Listen & Type / Dictogloss Only</option>
+            <option value="read-and-complete">✍️ Read & Complete (Letter Boxes) Only</option>
+            <option value="interactive-reading">📖 Interactive Reading (6-Step Suite) Only</option>
+            <option value="interactive-writing">📝 Interactive Writing Only</option>
+            <option value="write-about-photo">🧩 Collocation Chunk Writing Only</option>
+            <option value="speaking-sample">🎤 Speaking Sample Only</option>
+            <option value="interactive-speaking">🎙️ Interactive Speaking Only</option>
+            <option value="read-aloud">🗣️ Read Aloud / Shadowing Only</option>
+            <option value="listen-and-type">🎧 Listen & Type / Dictogloss Only</option>
           </select>
           {hasSpeakingBlock && (
             <div className="pt-2 border-t border-slate-100 flex items-center justify-between">

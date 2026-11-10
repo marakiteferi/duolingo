@@ -1,0 +1,1709 @@
+// fix-phase1-backend-and-db.mjs
+// Run from project root: node fix-phase1-backend-and-db.mjs
+import fs from 'node:fs';
+import path from 'node:path';
+
+const files = {
+  // =========================================================================
+  // 1. PYTHON BACKEND: Curated YouTube Pack + Deterministic Local MP3 Caching
+  // =========================================================================
+  'stt-backend/app.py': `import os
+import sys
+import json
+import uuid
+import shutil
+import subprocess
+from typing import Optional
+
+# Explicitly register PyTorch CUDA/cuDNN DLL directory on Windows for Python 3.8+
+torch_lib_candidates = [
+    os.path.join(os.path.dirname(__file__), "whisper-env", "Lib", "site-packages", "torch", "lib"),
+    r"C:\\Users\\Golden Leaf\\OneDrive\\Documents\\projects\\Duolingo practice app\\stt-backend\\whisper-env\\Lib\\site-packages\\torch\\lib",
+]
+for dll_dir in torch_lib_candidates:
+    if os.path.exists(dll_dir) and hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(dll_dir)
+            os.environ["PATH"] = dll_dir + os.pathsep + os.environ.get("PATH", "")
+            print(f"Registered CUDA DLL directory: {dll_dir}")
+            break
+        except Exception as e:
+            print(f"Warning registering DLL dir {dll_dir}: {e}")
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from faster_whisper import WhisperModel
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AUDIO_DIR = os.path.join(BASE_DIR, "audio_clips")
+MANIFEST_PATH = os.path.join(AUDIO_DIR, "curated_manifest.json")
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
+
+print("Loading Faster-Whisper model...")
+model = WhisperModel("large-v3-turbo", device="cuda", compute_type="int8_float16")
+print("Model loaded successfully!")
+
+def load_manifest() -> dict:
+    if os.path.exists(MANIFEST_PATH):
+        try:
+            with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_manifest(data: dict):
+    with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+def run_whisper_on_file(filepath: str, verbatim_prompt: bool = True):
+    prompt_str = "Uh, um, like, so yeah, well, [cough], [silent]..." if verbatim_prompt else None
+    segments, info = model.transcribe(
+        filepath,
+        beam_size=5,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        initial_prompt=prompt_str
+    )
+    total_duration = round(float(info.duration or 0.0), 1)
+    flat_parts = []
+    timestamped_lines = []
+    prev_end = 0.0
+
+    for segment in segments:
+        seg_text = segment.text.strip()
+        if not seg_text:
+            continue
+        gap = segment.start - prev_end
+        if prev_end > 0 and gap >= 1.0:
+            timestamped_lines.append(f"[PAUSE {gap:.1f}s]")
+        timestamped_lines.append(f"[{segment.start:.1f}s - {segment.end:.1f}s] {seg_text}")
+        flat_parts.append(seg_text)
+        prev_end = segment.end
+
+    return {
+        "text": " ".join(flat_parts).strip(),
+        "timestampedText": "\\n".join(timestamped_lines).strip(),
+        "duration": total_duration,
+    }
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "model": "large-v3-turbo", "device": "cuda"}
+
+@app.get("/audio/manifest")
+async def get_audio_manifest():
+    manifest = load_manifest()
+    valid = {}
+    for k, v in manifest.items():
+        fname = v.get("filename", "")
+        if fname and os.path.exists(os.path.join(AUDIO_DIR, fname)):
+            valid[k] = v
+    return valid
+
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    temp_file = os.path.join(BASE_DIR, f"temp_{uuid.uuid4().hex}_{file.filename}")
+    try:
+        with open(temp_file, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        return run_whisper_on_file(temp_file, verbatim_prompt=True)
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+@app.post("/audio/upload")
+async def upload_human_audio(
+    file: UploadFile = File(...),
+    auto_transcribe: bool = Form(True)
+):
+    ext = os.path.splitext(file.filename or "clip.mp3")[1].lower() or ".mp3"
+    safe_name = f"human_{uuid.uuid4().hex[:10]}{ext}"
+    dest_path = os.path.join(AUDIO_DIR, safe_name)
+
+    with open(dest_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    transcript_data = {"text": "", "timestampedText": "", "duration": 0.0}
+    if auto_transcribe:
+        transcript_data = run_whisper_on_file(dest_path, verbatim_prompt=False)
+
+    return {
+        "audioUrl": f"http://127.0.0.1:8000/audio/{safe_name}",
+        "filename": safe_name,
+        "text": transcript_data["text"],
+        "timestampedText": transcript_data["timestampedText"],
+        "duration": transcript_data["duration"],
+    }
+
+class YoutubeClipRequest(BaseModel):
+    url: str
+    startTime: Optional[str] = "00:20"
+    endTime: Optional[str] = "01:35"
+    clipKey: Optional[str] = None
+
+@app.post("/audio/youtube")
+async def import_youtube_clip(req: YoutubeClipRequest):
+    manifest = load_manifest()
+    if req.clipKey and req.clipKey in manifest:
+        cached = manifest[req.clipKey]
+        cached_path = os.path.join(AUDIO_DIR, cached.get("filename", ""))
+        if os.path.exists(cached_path):
+            return cached
+
+    clip_id = req.clipKey if req.clipKey else f"yt_{uuid.uuid4().hex[:10]}"
+    output_template = os.path.join(AUDIO_DIR, f"{clip_id}.%(ext)s")
+    final_mp3 = os.path.join(AUDIO_DIR, f"{clip_id}.mp3")
+
+    section_arg = f"*{req.startTime}-{req.endTime}" if req.startTime and req.endTime else "*00:20-01:35"
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "-x", "--audio-format", "mp3",
+        "--audio-quality", "128K",
+        "--download-sections", section_arg,
+        "--force-keyframes-at-cuts",
+        "-o", output_template,
+        req.url
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if proc.returncode != 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"yt-dlp error: {proc.stderr.strip() or proc.stdout.strip()}. Make sure yt-dlp and ffmpeg are installed."
+            )
+    except FileNotFoundError:
+        raise HTTPException(status_code=400, detail="yt-dlp not found. Run: pip install -U yt-dlp")
+
+    saved_file = final_mp3
+    if not os.path.exists(saved_file):
+        matches = [f for f in os.listdir(AUDIO_DIR) if f.startswith(clip_id)]
+        if not matches:
+            raise HTTPException(status_code=500, detail="Audio file was not generated by yt-dlp.")
+        saved_file = os.path.join(AUDIO_DIR, matches[0])
+
+    transcript_data = run_whisper_on_file(saved_file, verbatim_prompt=False)
+    filename = os.path.basename(saved_file)
+
+    result_payload = {
+        "audioUrl": f"http://127.0.0.1:8000/audio/{filename}",
+        "filename": filename,
+        "text": transcript_data["text"],
+        "timestampedText": transcript_data["timestampedText"],
+        "duration": transcript_data["duration"],
+    }
+
+    if req.clipKey:
+        manifest[req.clipKey] = result_payload
+        save_manifest(manifest)
+
+    return result_payload
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+`,
+
+  // =========================================================================
+  // 2. TYPES: Add youtubeSource, ReadAndCompleteData, InteractiveReadingData
+  // =========================================================================
+  'src/types/index.ts': `export type DETSkill = 'reading' | 'writing' | 'speaking' | 'listening';
+
+export type DETQuestionType =
+  | 'interactive-reading'
+  | 'read-and-complete'
+  | 'read-aloud'
+  | 'write-about-photo'
+  | 'listen-and-type'
+  | 'interactive-writing'
+  | 'interactive-speaking'
+  | 'speaking-sample';
+
+export type BlockType =
+  | 'interactive-reading'
+  | 'brain-dump'
+  | 'vocab-writing'
+  | 'speaking'
+  | 'shadowing'
+  | 'dictogloss'
+  | 'mock-test'
+  | 'custom';
+
+export type STTProvider = 'local-whisper' | 'whisper' | 'web-speech-api';
+export type ViewMode = 'config' | 'exam';
+export type AppView = ViewMode;
+export type SessionStatus = 'in-progress' | 'completed' | 'abandoned';
+export type ScoreScale = 'det-0-160' | 'custom';
+export type ConfigSection = 'templates' | 'questions' | 'eval-prompts' | 'history' | 'settings';
+
+export interface SRSData {
+  easeFactor: number;
+  intervalDays: number;
+  repetitions: number;
+  nextReviewDate: string;
+}
+
+export interface SRSDefaults {
+  startEase: number;
+  startIntervalDays: number;
+}
+
+export interface Settings {
+  id: 'app-settings';
+  geminiApiKey: string;
+  sttProvider: STTProvider;
+  localWhisperUrl?: string;
+  localSttEndpoint?: string;
+  sttApiKey?: string;
+  autoAdvanceDefault: boolean;
+  instantFeedbackDefault?: boolean;
+  srsDefaults: SRSDefaults;
+}
+
+export interface ClozeBlankItem {
+  id: string;
+  options: string[];
+  correctAnswer: string;
+}
+
+export interface InteractiveReadingData {
+  sourceName: string;
+  paragraph1WithBlanks: string;
+  paragraph1Sentences: string[];
+  blanks: ClozeBlankItem[];
+  passageGapOptions: string[];
+  correctPassageGap: string;
+  paragraph2Sentences: string[];
+  highlightQuestion1: string;
+  correctHighlight1: string;
+  highlightQuestion2: string;
+  correctHighlight2: string;
+  mainIdeaOptions: string[];
+  correctMainIdea: string;
+  titleOptions: string[];
+  correctTitle: string;
+}
+
+export interface ReadAndCompleteBlank {
+  id: string;
+  prefix: string;
+  missingSuffix: string;
+  fullWord: string;
+}
+
+export interface ReadAndCompleteData {
+  sourceName: string;
+  title: string;
+  passageWithBlanks: string;
+  blanks: ReadAndCompleteBlank[];
+}
+
+export interface YoutubeAudioSource {
+  clipKey: string;
+  url: string;
+  startTime: string;
+  endTime: string;
+  speaker: string;
+}
+
+export interface QuestionBankItem {
+  id: string;
+  skill: DETSkill;
+  type: DETQuestionType;
+  prompt: string;
+  sampleAnswer?: string;
+  sourceAttribution?: string;
+  targetChunks?: string[];
+  sourceAudioText?: string;
+  audioUrl?: string;
+  youtubeSource?: YoutubeAudioSource;
+  interactiveReading?: InteractiveReadingData;
+  readAndComplete?: ReadAndCompleteData;
+  difficulty: number | 'easy' | 'mid' | 'hard';
+  tags: string[];
+  srs?: SRSData;
+}
+
+export interface EvalPrompt {
+  id: string;
+  name: string;
+  appliesToType: BlockType;
+  promptText: string;
+  scoreScale: ScoreScale;
+}
+
+export interface Block {
+  id: string;
+  name: string;
+  type: BlockType;
+  durationSec: number;
+  instructions: string;
+  questionSetId?: string;
+  preferredQuestionType?: DETQuestionType | 'adaptive';
+  autoAdvance: boolean;
+  evalPromptId: string;
+}
+
+export type BlockConfig = Block;
+
+export interface SessionTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  blocks: Block[];
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+}
+
+export interface AIFeedback {
+  overallScore?: number;
+  subscores: Record<string, number>;
+  criteria: Record<string, string>;
+  strengths: string[];
+  weaknesses: string[];
+  suggestions: string[];
+  suggestedFix?: string;
+  note?: string;
+}
+
+export interface BlockResponse {
+  blockId: string;
+  type?: BlockType;
+  questionType?: string;
+  questionId?: string;
+  promptSnapshot?: string;
+  textOrTranscript?: string;
+  timestampedTranscript?: string;
+  audioDurationSec?: number;
+  fragmentNotes?: string;
+  attemptCount?: number;
+  previousDraft?: string;
+  audioBlobRef?: string;
+  isComplete: boolean;
+  timeSpentSec: number;
+  fillerCount?: number;
+  wpm?: number;
+  aiSubscores?: Record<string, number>;
+  aiOverallScore?: number;
+  aiFeedback?: AIFeedback;
+  evalPendingOffline?: boolean;
+}
+
+export interface SessionSummary {
+  overallScore?: number;
+  perSkillScores?: Partial<Record<DETSkill, number>>;
+  durationSec: number;
+}
+
+export interface SessionRun {
+  id: string;
+  templateId: string | null;
+  templateName: string;
+  blockConfigs: BlockConfig[];
+  status: SessionStatus;
+  currentBlockIndex: number;
+  overallElapsedSec: number;
+  instantFeedback?: boolean;
+  communicativePressure?: boolean;
+  preferredQuestionType?: DETQuestionType | 'all' | 'adaptive';
+  startedAt: string;
+  endedAt: string | null;
+  responses: Record<string, BlockResponse>;
+  summary?: SessionSummary;
+}
+`,
+
+  // =========================================================================
+  // 3. DATABASE: Preserves 'det-prep-app' DB + 10 Read & Complete + 6 TED Talks
+  // =========================================================================
+  'src/db/database.ts': `import Dexie, { type Table } from 'dexie';
+import type {
+  Settings,
+  QuestionBankItem,
+  EvalPrompt,
+  SessionTemplate,
+  SessionRun,
+} from '../types';
+
+export const DEFAULT_WRITING_PROMPT = \`You are an expert Duolingo English Test (DET) evaluator. Grade the provided response against the official DET rubric, strictly calibrating for a target score band of 140-150 (C1/C2 graduate proficiency). Focus on syntactic complexity (subordination, embedded clauses), collocation accuracy, and cohesive transitions.
+
+Task / Prompt: {{prompt}}
+Verified Time Spent: {{durationSec}} seconds
+Student Response:
+{{response}}
+
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "overallScore": <number 0-160>,
+  "subscores": { "literacy": <0-160>, "comprehension": <0-160>, "conversation": <0-160>, "production": <0-160> },
+  "criteria": { "grammar": "<concise grammar/clause critique>", "vocabulary": "<collocation/chunk assessment>", "coherence": "<transitions assessment>" },
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<specific recurring error 1>", "<specific error 2>"],
+  "suggestions": ["<actionable fix 1>", "<actionable fix 2>"],
+  "suggestedFix": "<A 150-band C1/C2 rewrite of the student's weakest sentences>"
+}\`;
+
+export const DEFAULT_SPEAKING_PROMPT = \`You are an expert Duolingo English Test (DET) speaking evaluator. Grade the verbatim timestamped speech transcript against the official DET rubric for a target score band of 140-150.
+
+CRITICAL TIMING & TIMESTAMP INSTRUCTIONS:
+1. The student's ACTUAL verified total audio recording duration is {{durationSec}} seconds (Speaking rate: {{wpm}} WPM, Fillers detected: {{fillerCount}}). NEVER claim the student spoke for less than {{durationSec}} seconds.
+2. The transcript includes exact segment timestamps [start - end] and [PAUSE Xs] markers generated by Faster-Whisper. Use these timestamps to evaluate acoustic fluency, clause-boundary pacing, hesitation clusters ("uh", "um"), and mid-clause pauses.
+
+Speaking Task / Prompt: {{prompt}}
+Verified Total Recording Duration: {{durationSec}} seconds ({{wpm}} WPM, {{fillerCount}} fillers)
+Timestamped Verbatim Transcript:
+{{transcript}}
+
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "overallScore": <number 0-160>,
+  "subscores": { "literacy": <0-160>, "comprehension": <0-160>, "conversation": <0-160>, "production": <0-160> },
+  "criteria": { "fluency": "<pace, [PAUSE] analysis & duration assessment>", "lexical_diversity": "<collocations & academic chunks>", "grammar": "<spoken syntactic complexity>" },
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "weaknesses": ["<specific fluency/grammar gap 1>", "<specific gap 2>"],
+  "suggestions": ["<specific tip 1>", "<specific tip 2>"],
+  "suggestedFix": "<A polished 150-score spoken version incorporating high-level collocations>"
+}\`;
+
+export const DEFAULT_SHADOWING_PROMPT = \`You are an SLA speech prosody and shadowing evaluator. Compare the source native passage against the student's simultaneous shadowed transcript (recorded over {{durationSec}} seconds). Evaluate word retention, chunk automaticity, and hesitation markers.
+
+Source Native Passage:
+{{prompt}}
+
+Student Shadowed Timestamped Transcript ({{durationSec}}s):
+{{transcript}}
+
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "overallScore": <number 0-160>,
+  "subscores": { "literacy": <0-160>, "comprehension": <0-160>, "conversation": <0-160>, "production": <0-160> },
+  "criteria": { "fluency": "<rhythm & pause synchronization>", "accuracy": "<dropped words or stumbled chunks>", "grammar": "<structural retention>" },
+  "strengths": ["<strength 1>"],
+  "weaknesses": ["<dropped or hesitated chunk>"],
+  "suggestions": ["<motor-auditory shadowing drill tip>"],
+  "suggestedFix": "<Key multi-word chunks from the source passage to drill aloud>"
+}\`;
+
+export const DEFAULT_DICTOGLOSS_PROMPT = \`You are an SLA Dictogloss working-memory and syntactic reconstruction evaluator. Grade how accurately the student reconstructed the core meaning of the source lecture passage using their own complex subordination and academic collocations (do NOT require verbatim word matching).
+
+Original Lecture Passage:
+{{prompt}}
+
+Student Reconstructed Text (Time spent: {{durationSec}}s):
+{{response}}
+
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "overallScore": <number 0-160>,
+  "subscores": { "literacy": <0-160>, "comprehension": <0-160>, "conversation": <0-160>, "production": <0-160> },
+  "criteria": { "comprehension": "<retention of core thesis & causal links>", "grammar": "<subordination & clause embedding>", "vocabulary": "<academic collocations>" },
+  "strengths": ["<strength 1>"],
+  "weaknesses": ["<missing nuance or syntactic weakness>"],
+  "suggestions": ["<note-taking compression or syntax tip>"],
+  "suggestedFix": "<A 150-band C1/C2 reconstruction of the passage>"
+}\`;
+
+export function buildRichQuestionBank(): QuestionBankItem[] {
+  return [
+    // =====================================================================
+    // 1. INTERACTIVE READING (6-Step Suites from BBC & The Conversation)
+    // =====================================================================
+    {
+      id: 'ir-conversation-optogenetics',
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'The Conversation (Neuroscience)',
+      prompt: 'Interactive Reading: Optogenetics and Controlling Brain Cells with Light (The Conversation)',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'the-conversation', 'neuroscience'],
+      interactiveReading: {
+        sourceName: 'The Conversation — Neuroscience & Optogenetics',
+        paragraph1WithBlanks:
+          'A discovery in tiny green algae has led to a breakthrough technique known as optogenetics, which allows neuroscientists to {{1}} specific brain cells on and off using beams of light. When light hits a light-sensitive molecule called retinaldehyde inside the channelrhodopsin protein, the molecule {{2}} its physical shape. This structural shift opens a microscopic {{3}} through the cell membrane, allowing positively charged sodium ions to flow rapidly into the neuron and {{4}} an electrical signal.',
+        paragraph1Sentences: [
+          'A discovery in tiny green algae has led to a breakthrough technique known as optogenetics, which allows neuroscientists to switch specific brain cells on and off using beams of light.',
+          'When light hits a light-sensitive molecule called retinaldehyde inside the channelrhodopsin protein, the molecule alters its physical shape.',
+          'This structural shift opens a microscopic passage through the cell membrane, allowing positively charged sodium ions to flow rapidly into the neuron and trigger an electrical signal.',
+        ],
+        blanks: [
+          { id: '1', options: ['switch', 'dissolve', 'obscure', 'postpone'], correctAnswer: 'switch' },
+          { id: '2', options: ['alters', 'ignores', 'forbids', 'depletes'], correctAnswer: 'alters' },
+          { id: '3', options: ['passage', 'obstacle', 'illusion', 'sediment'], correctAnswer: 'passage' },
+          { id: '4', options: ['trigger', 'suppress', 'abandon', 'conceal'], correctAnswer: 'trigger' },
+        ],
+        passageGapOptions: [
+          'By inserting the genes for these algal proteins into specific mammalian neurons, researchers gained unprecedented control over living neural circuits.',
+          'Nevertheless, marine biologists argue that freshwater algae cannot survive outside tropical ocean currents.',
+          'Consequently, traditional pharmaceutical drugs have completely replaced optical fibers in all modern hospitals.',
+          'In contrast, sodium ions are entirely absent from the nervous systems of vertebrate animals.',
+        ],
+        correctPassageGap:
+          'By inserting the genes for these algal proteins into specific mammalian neurons, researchers gained unprecedented control over living neural circuits.',
+        paragraph2Sentences: [
+          'In a landmark experiment, scientists used optogenetics to tag the exact nerve cells in the mouse brain memory center that were active during a fear-conditioning trial.',
+          'Days later, when researchers switched those tagged cells back on with a laser in a completely safe environment, the mice immediately froze in fear.',
+          'Control mice that had not undergone the initial conditioning did not freeze, proving that the light pulse was reactivating a specific stored memory.',
+          'Today, this precision tool is opening clinical possibilities for restoring lost vision in retinal disease and regulating abnormal neural rhythms in Parkinsonian disorders.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that explains what physically happens to the cell membrane when retinaldehyde changes shape.',
+        correctHighlight1:
+          'This structural shift opens a microscopic passage through the cell membrane, allowing positively charged sodium ions to flow rapidly into the neuron and trigger an electrical signal.',
+        highlightQuestion2:
+          'Click the sentence that proves the laser light was reactivating a genuine memory rather than causing an automatic reflex in all mice.',
+        correctHighlight2:
+          'Control mice that had not undergone the initial conditioning did not freeze, proving that the light pulse was reactivating a specific stored memory.',
+        mainIdeaOptions: [
+          'Light-sensitive proteins derived from algae enable scientists to precisely control neurons, reactivate specific memories, and explore targeted treatments for neurological disorders.',
+          'Green algae rely on sodium ions to navigate toward sunlight in deep freshwater lakes.',
+          'Fear conditioning in rodents permanently damages the retinaldehyde molecules inside the visual cortex.',
+          'Laser surgery has become the primary method for removing damaged tissue in patients with Parkinsonian disorders.',
+        ],
+        correctMainIdea:
+          'Light-sensitive proteins derived from algae enable scientists to precisely control neurons, reactivate specific memories, and explore targeted treatments for neurological disorders.',
+        titleOptions: [
+          'Illuminating the Brain: How Algal Proteins Unlocked Optical Control of Neurons',
+          'The Ecological Decline of Green Algae in Freshwater Habitats',
+          'Why Pharmaceutical Treatments Fail to Cross the Cell Membrane',
+          'A History of Laser Manufacturing in Modern Ophthalmology',
+        ],
+        correctTitle:
+          'Illuminating the Brain: How Algal Proteins Unlocked Optical Control of Neurons',
+      },
+    },
+    {
+      id: 'ir-bbc-atlantic-mosquitoes',
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'BBC Science Focus (Ecology & Epidemiology)',
+      prompt: 'Interactive Reading: Biodiversity Loss and Mosquito Host Shifts in Brazil (BBC Science Focus)',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'bbc', 'ecology'],
+      interactiveReading: {
+        sourceName: 'BBC Science Focus — Ecology & Vector-Borne Disease',
+        paragraph1WithBlanks:
+          'Disease-carrying mosquitoes in Brazil’s Atlantic Forest are increasingly {{1}} humans over wild animals, raising urgent concerns that habitat degradation is pushing dangerous vectors closer to human settlements. When researchers captured engorged female mosquitoes inside protected nature reserves and sequenced the DNA of their blood meals, they discovered a striking {{2}} for human hosts. Nearly three-quarters of the analyzed blood meals originated from humans, a finding that {{3}} the research team given that the light traps were positioned deep inside forested reserves with {{4}} human presence.',
+        paragraph1Sentences: [
+          'Disease-carrying mosquitoes in Brazil’s Atlantic Forest are increasingly targeting humans over wild animals, raising urgent concerns that habitat degradation is pushing dangerous vectors closer to human settlements.',
+          'When researchers captured engorged female mosquitoes inside protected nature reserves and sequenced the DNA of their blood meals, they discovered a striking preference for human hosts.',
+          'Nearly three-quarters of the analyzed blood meals originated from humans, a finding that surprised the research team given that the light traps were positioned deep inside forested reserves with minimal human presence.',
+        ],
+        blanks: [
+          { id: '1', options: ['targeting', 'evading', 'nourishing', 'sheltering'], correctAnswer: 'targeting' },
+          { id: '2', options: ['preference', 'aversion', 'indifference', 'immunity'], correctAnswer: 'preference' },
+          { id: '3', options: ['surprised', 'reassured', 'discredited', 'pacified'], correctAnswer: 'surprised' },
+          { id: '4', options: ['minimal', 'excessive', 'universal', 'mandatory'], correctAnswer: 'minimal' },
+        ],
+        passageGapOptions: [
+          'The genetic evidence suggests that mosquitoes are flying out of the forest reserves to feed on nearby residents before returning to the canopy to rest.',
+          'As a result, entomologists concluded that female mosquitoes no longer require blood meals to develop their eggs.',
+          'Meanwhile, urban architects have begun constructing taller apartment buildings across South America.',
+          'Conversely, DNA sequencing cannot distinguish between mammalian and avian blood samples.',
+        ],
+        correctPassageGap:
+          'The genetic evidence suggests that mosquitoes are flying out of the forest reserves to feed on nearby residents before returning to the canopy to rest.',
+        paragraph2Sentences: [
+          'Ecological degradation around the reserves is playing a decisive role in driving this behavioral shift.',
+          'As deforestation fragments the surrounding landscape, the wild vertebrates that mosquitoes normally feed upon become scarce, forcing the insects to seek alternative hosts.',
+          'This adaptation is alarming because these vectors transmit severe pathogens, including dengue, Zika, malaria, and yellow fever.',
+          'Researchers emphasize that preserving intact forest buffers and maintaining ecological equilibrium is essential to prevent mosquitoes from permanently adapting to human blood.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that explains the laboratory method scientists used to determine which species the mosquitoes had bitten.',
+        correctHighlight1:
+          'When researchers captured engorged female mosquitoes inside protected nature reserves and sequenced the DNA of their blood meals, they discovered a striking preference for human hosts.',
+        highlightQuestion2:
+          'Click the sentence that explains why the loss of surrounding forest forces mosquitoes to change their feeding behavior.',
+        correctHighlight2:
+          'As deforestation fragments the surrounding landscape, the wild vertebrates that mosquitoes normally feed upon become scarce, forcing the insects to seek alternative hosts.',
+        mainIdeaOptions: [
+          'Deforestation and declining wildlife populations are driving forest mosquitoes to feed predominantly on humans, elevating the risk of vector-borne disease outbreaks.',
+          'Light traps placed one kilometer inside nature reserves are ineffective at capturing female mosquitoes.',
+          'DNA sequencing has eradicated yellow fever and dengue across Brazil’s Atlantic Forest.',
+          'Wild vertebrates in tropical reserves have developed natural immunity to mosquito bites.',
+        ],
+        correctMainIdea:
+          'Deforestation and declining wildlife populations are driving forest mosquitoes to feed predominantly on humans, elevating the risk of vector-borne disease outbreaks.',
+        titleOptions: [
+          'Driven by Deforestation: Why Forest Mosquitoes Are Developing a Taste for Human Blood',
+          'Advances in Light-Trap Engineering for Tropical Entomology',
+          'The Complete Eradication of Malaria in South American Cities',
+          'How Urbanization Increases Wildlife Populations in Nature Reserves',
+        ],
+        correctTitle:
+          'Driven by Deforestation: Why Forest Mosquitoes Are Developing a Taste for Human Blood',
+      },
+    },
+    {
+      id: 'ir-bbc-synthetic-cell',
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'BBC Science Focus (Synthetic Biology)',
+      prompt: 'Interactive Reading: Building Synthetic Life from Scratch (BBC Science Focus)',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'bbc', 'biology'],
+      interactiveReading: {
+        sourceName: 'BBC Science Focus — Synthetic Biology',
+        paragraph1WithBlanks:
+          'Biochemists have engineered the world’s first synthetic cell-like system capable of growing, {{1}}, and repeating a complete cell cycle from chemical components. Because living organisms are {{2}} complex, biologists have long struggled to distinguish which cellular mechanisms are strictly essential for life and which are merely evolutionary extras. By constructing a simplified artificial cell from the bottom up, researchers can {{3}} individual biological variables one by one and prove that fundamental processes like replication do not require a mysterious {{4}} spark.',
+        paragraph1Sentences: [
+          'Biochemists have engineered the world’s first synthetic cell-like system capable of growing, dividing, and repeating a complete cell cycle from chemical components.',
+          'Because living organisms are extraordinarily complex, biologists have long struggled to distinguish which cellular mechanisms are strictly essential for life and which are merely evolutionary extras.',
+          'By constructing a simplified artificial cell from the bottom up, researchers can isolate individual biological variables one by one and prove that fundamental processes like replication do not require a mysterious vital spark.',
+        ],
+        blanks: [
+          { id: '1', options: ['dividing', 'vanishing', 'petrifying', 'conceding'], correctAnswer: 'dividing' },
+          { id: '2', options: ['extraordinarily', 'negligibly', 'reluctantly', 'superficially'], correctAnswer: 'extraordinarily' },
+          { id: '3', options: ['isolate', 'confuse', 'conceal', 'discard'], correctAnswer: 'isolate' },
+          { id: '4', options: ['vital', 'trivial', 'dormant', 'obsolete'], correctAnswer: 'vital' },
+        ],
+        passageGapOptions: [
+          'Despite this milestone in chemical replication, the synthetic cell cannot yet survive independently without external molecular support.',
+          'Therefore, all natural bacteria have ceased producing proteins in laboratory environments.',
+          'In addition, fluorescent microscopy was outlawed by international chemistry conventions.',
+          'However, synthetic cells are already larger and more complex than multicellular mammals.',
+        ],
+        correctPassageGap:
+          'Despite this milestone in chemical replication, the synthetic cell cannot yet survive independently without external molecular support.',
+        paragraph2Sentences: [
+          'Specifically, the artificial cell lacks the ability to manufacture its own ribosomes, the microscopic molecular machines responsible for assembling proteins.',
+          'Instead, the synthetic system must borrow functional ribosomes from specially engineered external support structures.',
+          'If these findings hold up under rigorous peer review, scientists believe the platform will usher in a new generation of programmable biological engineering.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that explains why studying natural living cells makes it difficult to identify the minimum requirements for life.',
+        correctHighlight1:
+          'Because living organisms are extraordinarily complex, biologists have long struggled to distinguish which cellular mechanisms are strictly essential for life and which are merely evolutionary extras.',
+        highlightQuestion2:
+          'Click the sentence that identifies the specific molecular machinery the synthetic cell is currently unable to build on its own.',
+        correctHighlight2:
+          'Specifically, the artificial cell lacks the ability to manufacture its own ribosomes, the microscopic molecular machines responsible for assembling proteins.',
+        mainIdeaOptions: [
+          'Researchers have created a simplified synthetic cell that can grow and divide chemically, offering a powerful model to study the fundamental mechanics of life despite still relying on borrowed ribosomes.',
+          'Ribosomes are no longer necessary for protein synthesis in modern biological organisms.',
+          'Synthetic cells have completely replaced natural microorganisms in agricultural production.',
+          'Peer review has disproven the possibility of replicating cellular membranes in a chemistry lab.',
+        ],
+        correctMainIdea:
+          'Researchers have created a simplified synthetic cell that can grow and divide chemically, offering a powerful model to study the fundamental mechanics of life despite still relying on borrowed ribosomes.',
+        titleOptions: [
+          'Life from Scratch: How a Dividing Synthetic Cell Is Redining Biology',
+          'The History of Fluorescent Microscopy in Nineteenth-Century Chemistry',
+          'Why Ribosomes Prevent Natural Cells from Dividing',
+          'Eliminating Protein Synthesis in Multicellular Organisms',
+        ],
+        correctTitle:
+          'Life from Scratch: How a Dividing Synthetic Cell Is Redining Biology',
+      },
+    },
+    {
+      id: 'ir-bbc-heatwaves-brain',
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'BBC Science Focus (Neurobiology & Climate)',
+      prompt: 'Interactive Reading: How Extreme Heatwaves Disrupt Human Brain Function (BBC Science Focus)',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'bbc', 'neuroscience', 'climate'],
+      interactiveReading: {
+        sourceName: 'BBC Science Focus — Neurobiology & Climate Health',
+        paragraph1WithBlanks:
+          'More frequent and intense heatwaves are not merely damaging ecosystems; they are directly {{1}} human cognitive function and neurological stability. Brain cells operate within a narrow optimal thermal window, and when ambient temperatures climb above that threshold, synaptic interactions become increasingly {{2}}. A neuron’s ability to fire relies on specialized proteins fitting into receptor sockets like a lock and key, but excessive heat causes these molecular keys to {{3}} their precise three-dimensional shape and {{4}} signal transmission.',
+        paragraph1Sentences: [
+          'More frequent and intense heatwaves are not merely damaging ecosystems; they are directly impairing human cognitive function and neurological stability.',
+          'Brain cells operate within a narrow optimal thermal window, and when ambient temperatures climb above that threshold, synaptic interactions become increasingly erratic.',
+          'A neuron’s ability to fire relies on specialized proteins fitting into receptor sockets like a lock and key, but excessive heat causes these molecular keys to lose their precise three-dimensional shape and misfire signal transmission.',
+        ],
+        blanks: [
+          { id: '1', options: ['impairing', 'enhancing', 'insulating', 'celebrating'], correctAnswer: 'impairing' },
+          { id: '2', options: ['erratic', 'infallible', 'dormant', 'effortless'], correctAnswer: 'erratic' },
+          { id: '3', options: ['lose', 'solidify', 'multiply', 'duplicate'], correctAnswer: 'lose' },
+          { id: '4', options: ['misfire', 'accelerate', 'purify', 'guarantee'], correctAnswer: 'misfire' },
+        ],
+        passageGapOptions: [
+          'Compound this cellular disruption with the fact that extreme heat also compromises the blood-brain barrier and disrupts restorative slow-wave sleep.',
+          'Consequently, neurons function with far greater speed and accuracy during severe summer droughts.',
+          'On the other hand, receptor sockets are made of inorganic minerals that never react to temperature.',
+          'For this reason, neuroscientists recommend eliminating shade trees from metropolitan neighborhoods.',
+        ],
+        correctPassageGap:
+          'Compound this cellular disruption with the fact that extreme heat also compromises the blood-brain barrier and disrupts restorative slow-wave sleep.',
+        paragraph2Sentences: [
+          'Epidemiological data reveals that hospital admissions for neurological and mood disorders spike measurably during prolonged periods of extreme heat.',
+          'Decision-making, impulse control, and working memory degrade first as the prefrontal cortex struggles to regulate internal thermal stress.',
+          'Urban planners and public health officials must therefore treat urban cooling infrastructure not just as an environmental amenity, but as a critical safeguard for population brain health.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that uses a mechanical analogy to explain how heat interferes with synaptic receptors.',
+        correctHighlight1:
+          'A neuron’s ability to fire relies on specialized proteins fitting into receptor sockets like a lock and key, but excessive heat causes these molecular keys to lose their precise three-dimensional shape and misfire signal transmission.',
+        highlightQuestion2:
+          'Click the sentence that specifies which cognitive faculties deteriorate earliest when the brain experiences thermal stress.',
+        correctHighlight2:
+          'Decision-making, impulse control, and working memory degrade first as the prefrontal cortex struggles to regulate internal thermal stress.',
+        mainIdeaOptions: [
+          'Extreme heatwaves deform neural proteins and impair prefrontal cortex function, making urban cooling essential for protecting cognitive and neurological health.',
+          'The human brain adapts effortlessly to extreme heat by expanding the blood-brain barrier.',
+          'Prefrontal cortex activity increases significantly during prolonged summer heatwaves.',
+          'Hospital admissions for neurological conditions decline when ambient temperatures exceed optimal thresholds.',
+        ],
+        correctMainIdea:
+          'Extreme heatwaves deform neural proteins and impair prefrontal cortex function, making urban cooling essential for protecting cognitive and neurological health.',
+        titleOptions: [
+          'The Overheated Mind: How Rising Temperatures Disrupt Neural Signaling',
+          'Why Synaptic Proteins Require High Temperatures to Replicate',
+          'The Architecture of Lock-and-Key Security Systems',
+          'How Slow-Wave Sleep Eliminates Urban Heat Islands',
+        ],
+        correctTitle:
+          'The Overheated Mind: How Rising Temperatures Disrupt Neural Signaling',
+      },
+    },
+    {
+      id: 'ir-conversation-ai-economics',
+      skill: 'reading',
+      type: 'interactive-reading',
+      sourceAttribution: 'The Conversation / Nobel Economic Dialogues',
+      prompt: 'Interactive Reading: Artificial Intelligence, Idea Recombination, and Labor Transitions (The Conversation)',
+      difficulty: 'hard',
+      tags: ['interactive-reading', 'the-conversation', 'economics', 'ai'],
+      interactiveReading: {
+        sourceName: 'The Conversation — Economics of Artificial Intelligence',
+        paragraph1WithBlanks:
+          'Economists studying technological revolutions emphasize that there is no {{1}} law guaranteeing that powerful technologies automatically produce broadly shared prosperity. Throughout history, economic innovation has functioned primarily through the {{2}} of existing ideas to generate novel industrial processes and new categories of work. While generative artificial intelligence can {{3}} this recombinant discovery process across scientific disciplines, its macroeconomic impact depends heavily on whether institutions {{4}} the technology toward augmenting human workers rather than merely automating routine labor.',
+        paragraph1Sentences: [
+          'Economists studying technological revolutions emphasize that there is no universal law guaranteeing that powerful technologies automatically produce broadly shared prosperity.',
+          'Throughout history, economic innovation has functioned primarily through the recombination of existing ideas to generate novel industrial processes and new categories of work.',
+          'While generative artificial intelligence can accelerate this recombinant discovery process across scientific disciplines, its macroeconomic impact depends heavily on whether institutions steer the technology toward augmenting human workers rather than merely automating routine labor.',
+        ],
+        blanks: [
+          { id: '1', options: ['universal', 'fragile', 'temporary', 'accidental'], correctAnswer: 'universal' },
+          { id: '2', options: ['recombination', 'eradication', 'isolation', 'concealment'], correctAnswer: 'recombination' },
+          { id: '3', options: ['accelerate', 'prohibit', 'relinquish', 'diminish'], correctAnswer: 'accelerate' },
+          { id: '4', options: ['steer', 'abandon', 'conceal', 'surrender'], correctAnswer: 'steer' },
+        ],
+        passageGapOptions: [
+          'Without deliberate policy guardrails and democratic participation, rapid automation risks displacing workers faster than the economy can transition them into emerging roles.',
+          'Consequently, economists agree that scientific experimentation should be permanently halted across all universities.',
+          'In contrast, historical technologies never required workers to learn new skills or adapt to new industries.',
+          'Therefore, corporate profits have declined to zero in every sector adopting machine learning.',
+        ],
+        correctPassageGap:
+          'Without deliberate policy guardrails and democratic participation, rapid automation risks displacing workers faster than the economy can transition them into emerging roles.',
+        paragraph2Sentences: [
+          'The central policy challenge is therefore smoothing the institutional transition from obsolete tasks to newly created, high-productivity occupations.',
+          'Achieving a socially beneficial trajectory requires that independent scientists, labor representatives, and public thinkers hold a seat at the regulatory table.',
+          'When governance frameworks prioritize human complementarity over unchecked cost-cutting, artificial intelligence can expand collective capability rather than deepen economic inequality.',
+        ],
+        highlightQuestion1:
+          'Click the sentence that explains the historical mechanism by which new ideas and new jobs are generated.',
+        correctHighlight1:
+          'Throughout history, economic innovation has functioned primarily through the recombination of existing ideas to generate novel industrial processes and new categories of work.',
+        highlightQuestion2:
+          'Click the sentence that defines the primary policy challenge facing governments during an AI-driven labor transition.',
+        correctHighlight2:
+          'The central policy challenge is therefore smoothing the institutional transition from obsolete tasks to newly created, high-productivity occupations.',
+        mainIdeaOptions: [
+          'Whether artificial intelligence yields shared prosperity or disruptive inequality depends on institutional governance that steers AI toward human augmentation and smooths labor transitions.',
+          'Technological progress follows an automatic economic law that guarantees equal wealth distribution without regulation.',
+          'Artificial intelligence prevents scientists from recombining older ideas into new discoveries.',
+          'Economists recommend replacing all human decision-makers with autonomous corporate algorithms.',
+        ],
+        correctMainIdea:
+          'Whether artificial intelligence yields shared prosperity or disruptive inequality depends on institutional governance that steers AI toward human augmentation and smooths labor transitions.',
+        titleOptions: [
+          'Governing the Transition: Why AI Prosperity Requires Institutional Steering',
+          'The Mathematical Inevitability of Technological Unemployment',
+          'Why Scientific Discovery No Longer Relies on Data Quality',
+          'Abolishing Regulatory Frameworks in the Digital Economy',
+        ],
+        correctTitle:
+          'Governing the Transition: Why AI Prosperity Requires Institutional Steering',
+      },
+    },
+
+    // =====================================================================
+    // 2. READ AND COMPLETE (10 Authentic C-Test Letter-Box Cloze Passages)
+    // =====================================================================
+    {
+      id: 'rc-bbc-acoustic-alzheimers',
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Neurology)',
+      prompt: 'Read and Complete: Acoustic Stimulation and Brain Plaque Clearance (BBC Science Focus)',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'neuroscience'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Neurology',
+        title: 'Acoustic Stimulation and Neural Waste Clearance',
+        passageWithBlanks:
+          'Non-invasive sound stimulation may help resynchronize brain {{1}} and restore the timing signals that instruct neural cleaning {{2}} when and where to clear toxic plaques. In a recent primate trial, subjects exposed to calibrated acoustic tones for one {{3}} daily exhibited a 200 percent {{4}} in beta-amyloid clearance within their cerebrospinal {{5}}. Remarkably, these elevated clearance levels {{6}} for five weeks after the trial concluded, offering a {{7}} clue for future neurodegenerative therapies.',
+        blanks: [
+          { id: '1', prefix: 'act', missingSuffix: 'ivity', fullWord: 'activity' },
+          { id: '2', prefix: 'sys', missingSuffix: 'tems', fullWord: 'systems' },
+          { id: '3', prefix: 'ho', missingSuffix: 'ur', fullWord: 'hour' },
+          { id: '4', prefix: 'inc', missingSuffix: 'rease', fullWord: 'increase' },
+          { id: '5', prefix: 'fl', missingSuffix: 'uid', fullWord: 'fluid' },
+          { id: '6', prefix: 'pers', missingSuffix: 'isted', fullWord: 'persisted' },
+          { id: '7', prefix: 'prom', missingSuffix: 'ising', fullWord: 'promising' },
+        ],
+      },
+    },
+    {
+      id: 'rc-conversation-orbital-datacenters',
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'The Conversation / Space Technology',
+      prompt: 'Read and Complete: Orbital Data Centers and Sustainable Computing',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'the-conversation', 'technology'],
+      readAndComplete: {
+        sourceName: 'The Conversation — Sustainable Computing',
+        title: 'Orbital Data Centers in Low Earth Orbit',
+        passageWithBlanks:
+          'As artificial intelligence drives an unprecedented surge in global {{1}} demand, aerospace engineers are exploring orbital data {{2}} powered by continuous solar {{3}} in space. Even after accounting for the carbon {{4}} generated by rocket launches, processing data in orbit could {{5}} the environmental footprint of cloud computing while relieving {{6}} on terrestrial power {{7}}.',
+        blanks: [
+          { id: '1', prefix: 'elect', missingSuffix: 'ricity', fullWord: 'electricity' },
+          { id: '2', prefix: 'cen', missingSuffix: 'ters', fullWord: 'centers' },
+          { id: '3', prefix: 'rad', missingSuffix: 'iation', fullWord: 'radiation' },
+          { id: '4', prefix: 'emis', missingSuffix: 'sions', fullWord: 'emissions' },
+          { id: '5', prefix: 'red', missingSuffix: 'uce', fullWord: 'reduce' },
+          { id: '6', prefix: 'str', missingSuffix: 'ain', fullWord: 'strain' },
+          { id: '7', prefix: 'gr', missingSuffix: 'ids', fullWord: 'grids' },
+        ],
+      },
+    },
+    {
+      id: 'rc-bbc-forensic-linguistics',
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Forensic Linguistics)',
+      prompt: 'Read and Complete: Detecting Deception Through Verbal Language Patterns (BBC Science Focus)',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'psychology'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Forensic Linguistics',
+        title: 'Verbal Clues to Deception',
+        passageWithBlanks:
+          'Contrary to popular belief, body language is an unreliable {{1}} of deception, whereas verbal language contains measurable {{2}} clues. Forensic linguists have demonstrated that individuals fabricating a story often use fewer first-person {{3}} to distance themselves psychologically from their {{4}}. Furthermore, the cognitive load of maintaining a false {{5}} frequently reduces syntactic {{6}} and sensory detail.',
+        blanks: [
+          { id: '1', prefix: 'ind', missingSuffix: 'icator', fullWord: 'indicator' },
+          { id: '2', prefix: 'ling', missingSuffix: 'uistic', fullWord: 'linguistic' },
+          { id: '3', prefix: 'pron', missingSuffix: 'ouns', fullWord: 'pronouns' },
+          { id: '4', prefix: 'stat', missingSuffix: 'ements', fullWord: 'statements' },
+          { id: '5', prefix: 'narr', missingSuffix: 'ative', fullWord: 'narrative' },
+          { id: '6', prefix: 'comp', missingSuffix: 'lexity', fullWord: 'complexity' },
+        ],
+      },
+    },
+    {
+      id: 'rc-bbc-mycorrhizal-networks',
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Forest Ecology)',
+      prompt: 'Read and Complete: Mycorrhizal Networks and Subterranean Resource Sharing',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'ecology'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Forest Ecology',
+        title: 'Subterranean Mycorrhizal Networks',
+        passageWithBlanks:
+          'Subterranean fungal networks connect temperate forest root systems into an expansive resource-sharing {{1}}. When mature trees absorb sunlight, they allocate excess carbon {{2}} across these mycorrhizal pathways to nourish younger {{3}} shaded beneath the canopy. Ecologists now recognize that treating trees as isolated competitors ignores the cooperative {{4}} that sustains old-growth forest {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'net', missingSuffix: 'work', fullWord: 'network' },
+          { id: '2', prefix: 'prod', missingSuffix: 'ucts', fullWord: 'products' },
+          { id: '3', prefix: 'see', missingSuffix: 'dlings', fullWord: 'seedlings' },
+          { id: '4', prefix: 'dyn', missingSuffix: 'amics', fullWord: 'dynamics' },
+          { id: '5', prefix: 'res', missingSuffix: 'ilience', fullWord: 'resilience' },
+        ],
+      },
+    },
+    {
+      id: 'rc-conversation-deep-sea-nodules',
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'The Conversation (Marine Geochemistry)',
+      prompt: 'Read and Complete: Polymetallic Nodules and Abyssal Ecosystems',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'the-conversation', 'marine'],
+      readAndComplete: {
+        sourceName: 'The Conversation — Marine Geochemistry',
+        title: 'Deep-Sea Mining and Abyssal Plain Ecology',
+        passageWithBlanks:
+          'Mining companies seeking battery metals are targeting polymetallic nodules resting on the abyssal {{1}} of the Pacific Ocean. However, marine biologists warn that vacuuming these ancient mineral deposits would obliterate fragile benthic {{2}} that require millennia to recover. Because deep-ocean currents are exceptionally {{3}}, suspended sediment plumes could drift for hundreds of miles, suffocating filter-feeding {{4}} throughout the water {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'pl', missingSuffix: 'ain', fullWord: 'plain' },
+          { id: '2', prefix: 'hab', missingSuffix: 'itats', fullWord: 'habitats' },
+          { id: '3', prefix: 'sl', missingSuffix: 'uggish', fullWord: 'sluggish' },
+          { id: '4', prefix: 'org', missingSuffix: 'anisms', fullWord: 'organisms' },
+          { id: '5', prefix: 'col', missingSuffix: 'umn', fullWord: 'column' },
+        ],
+      },
+    },
+    {
+      id: 'rc-bbc-circadian-clocks',
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Chronobiology)',
+      prompt: 'Read and Complete: Suprachiasmatic Clocks and Blue Light Disruption',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'biology'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Chronobiology',
+        title: 'Circadian Desynchronization and Metabolic Health',
+        passageWithBlanks:
+          'The human central circadian clock inside the suprachiasmatic nucleus coordinates hormonal secretion with solar {{1}}. Exposure to high-intensity blue light late at night suppresses pineal melatonin {{2}}, misaligning central neural rhythms with peripheral metabolic {{3}} in the liver and gut. Chronic circadian disruption impairs insulin {{4}} and significantly elevates long-term risks of cardiovascular {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'cy', missingSuffix: 'cles', fullWord: 'cycles' },
+          { id: '2', prefix: 'syn', missingSuffix: 'thesis', fullWord: 'synthesis' },
+          { id: '3', prefix: 'cl', missingSuffix: 'ocks', fullWord: 'clocks' },
+          { id: '4', prefix: 'sen', missingSuffix: 'sitivity', fullWord: 'sensitivity' },
+          { id: '5', prefix: 'dis', missingSuffix: 'orders', fullWord: 'disorders' },
+        ],
+      },
+    },
+    {
+      id: 'rc-conversation-quantum-repeaters',
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'The Conversation (Quantum Physics)',
+      prompt: 'Read and Complete: Quantum Key Distribution and Cryogenic Repeaters',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'the-conversation', 'physics'],
+      readAndComplete: {
+        sourceName: 'The Conversation — Quantum Physics',
+        title: 'Overcoming Photon Loss with Quantum Repeaters',
+        passageWithBlanks:
+          'Long-distance quantum key distribution remains severely constrained by exponential photon {{1}} across standard optical fiber lines. Because the fundamental no-cloning theorem prohibits conventional optical {{2}}, quantum communication networks must instead deploy cryogenic quantum {{3}}. These devices utilize entangled photon pairs and atomic spin memories to teleport quantum {{4}} across continental {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'at', missingSuffix: 'tenuation', fullWord: 'attenuation' },
+          { id: '2', prefix: 'amp', missingSuffix: 'lification', fullWord: 'amplification' },
+          { id: '3', prefix: 'rep', missingSuffix: 'eaters', fullWord: 'repeaters' },
+          { id: '4', prefix: 'st', missingSuffix: 'ates', fullWord: 'states' },
+          { id: '5', prefix: 'dis', missingSuffix: 'tances', fullWord: 'distances' },
+        ],
+      },
+    },
+    {
+      id: 'rc-bbc-permafrost-thaw',
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Climatology)',
+      prompt: 'Read and Complete: Thermokarst Methane Feedback in Arctic Permafrost',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'climate'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Climatology',
+        title: 'Arctic Permafrost Thaw and Methane Release',
+        passageWithBlanks:
+          'Accelerated Arctic warming is rapidly degrading subterranean permafrost across high-latitude tundra {{1}}. As frozen organic soils thaw, anaerobic microbes decompose centuries-old plant {{2}}, releasing massive volumes of potent methane gas into thermokarst {{3}}. Climatologists warn this process threatens to trigger an irreversible positive {{4}} loop in the global climate {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'reg', missingSuffix: 'ions', fullWord: 'regions' },
+          { id: '2', prefix: 'mat', missingSuffix: 'ter', fullWord: 'matter' },
+          { id: '3', prefix: 'la', missingSuffix: 'kes', fullWord: 'lakes' },
+          { id: '4', prefix: 'feed', missingSuffix: 'back', fullWord: 'feedback' },
+          { id: '5', prefix: 'sys', missingSuffix: 'tem', fullWord: 'system' },
+        ],
+      },
+    },
+    {
+      id: 'rc-conversation-neuromorphic-vision',
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'The Conversation (Neuromorphic Engineering)',
+      prompt: 'Read and Complete: Neuromorphic Silicon Retinas and Asynchronous Sensors',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'the-conversation', 'engineering'],
+      readAndComplete: {
+        sourceName: 'The Conversation — Neuromorphic Engineering',
+        title: 'Event-Based Neuromorphic Silicon Retinas',
+        passageWithBlanks:
+          'Conventional digital cameras capture scenes at fixed frame rates, producing excessive redundant {{1}} when monitoring static backgrounds. Neuromorphic silicon retinas, by contrast, only generate signals when individual pixels detect changes in local {{2}}. This event-based processing achieves microsecond temporal {{3}} while consuming orders of magnitude less electrical {{4}} for robotic {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'da', missingSuffix: 'ta', fullWord: 'data' },
+          { id: '2', prefix: 'ill', missingSuffix: 'umination', fullWord: 'illumination' },
+          { id: '3', prefix: 'res', missingSuffix: 'olution', fullWord: 'resolution' },
+          { id: '4', prefix: 'po', missingSuffix: 'wer', fullWord: 'power' },
+          { id: '5', prefix: 'nav', missingSuffix: 'igation', fullWord: 'navigation' },
+        ],
+      },
+    },
+    {
+      id: 'rc-bbc-synthetic-ribosomes',
+      skill: 'reading',
+      type: 'read-and-complete',
+      sourceAttribution: 'BBC Science Focus (Biochemistry)',
+      prompt: 'Read and Complete: Orthogonal Ribosomes and Non-Canonical Polymers',
+      difficulty: 'hard',
+      tags: ['read-and-complete', 'bbc', 'biochemistry'],
+      readAndComplete: {
+        sourceName: 'BBC Science Focus — Biochemistry',
+        title: 'Engineering Orthogonal Synthetic Ribosomes',
+        passageWithBlanks:
+          'Natural cellular ribosomes are restricted to synthesizing proteins exclusively from twenty canonical amino {{1}}. By engineering orthogonal synthetic ribosomes with modified catalytic {{2}}, biochemists can now program cells to incorporate unnatural chemical building {{3}}. This bioengineering advance permits the creation of novel peptidomimetic {{4}} with extraordinary enzymatic {{5}}.',
+        blanks: [
+          { id: '1', prefix: 'ac', missingSuffix: 'ids', fullWord: 'acids' },
+          { id: '2', prefix: 'cen', missingSuffix: 'ters', fullWord: 'centers' },
+          { id: '3', prefix: 'blo', missingSuffix: 'cks', fullWord: 'blocks' },
+          { id: '4', prefix: 'pol', missingSuffix: 'ymers', fullWord: 'polymers' },
+          { id: '5', prefix: 'sta', missingSuffix: 'bility', fullWord: 'stability' },
+        ],
+      },
+    },
+
+    // =====================================================================
+    // 3. CURATED YOUTUBE TALKS FOR ARGUELLES SHADOWING & DICTOGLOSS
+    // =====================================================================
+    {
+      id: 'yt-boroditsky-ted',
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'TED — Prof. Lera Boroditsky',
+      prompt: 'How Language Shapes the Way We Think: Cognitive Diversity and Spatial Metaphors (TED)',
+      sourceAudioText:
+        'Language is a uniquely human gift central to our human experience. When you compare languages across the world, they differ in profound and surprising ways. Some languages assign grammatical genders to inanimate objects, while others use absolute cardinal directions like north and south instead of relative terms like left and right, fundamentally reorganizing how speakers orient themselves in physical space.',
+      youtubeSource: {
+        clipKey: 'yt_boroditsky_ted',
+        url: 'https://www.youtube.com/watch?v=RKK7wGAYP6k',
+        startTime: '00:20',
+        endTime: '01:35',
+        speaker: 'Prof. Lera Boroditsky (Linguistics & Cognitive Science)',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'ted', 'linguistics', 'academic'],
+    },
+    {
+      id: 'yt-boroditsky-duocon',
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'Duocon Keynote — Prof. Lera Boroditsky',
+      prompt: 'Language, Thought, and Mental Representations (Duocon)',
+      sourceAudioText:
+        'When learning a new language, you are not merely memorizing alternative acoustic labels for concepts you already possess. You are inheriting a complex cognitive scaffold that shapes how your attention selects information from continuous visual reality, categorizes sensory stimuli, and commits salient events to episodic memory.',
+      youtubeSource: {
+        clipKey: 'yt_boroditsky_duocon',
+        url: 'https://www.youtube.com/watch?v=kBEBq2eP19k',
+        startTime: '00:30',
+        endTime: '01:45',
+        speaker: 'Prof. Lera Boroditsky (Duocon)',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'duocon', 'linguistics', 'c1-c2'],
+    },
+    {
+      id: 'yt-suleyman-ai',
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'TED — Mustafa Suleyman',
+      prompt: 'What Is an AI Anyway? The Coming Wave of Autonomous Synthesis (TED)',
+      sourceAudioText:
+        'We are witnessing the emergence of interactive artificial intelligence capable not only of synthesizing vast textual corpora, but of actively navigating dynamic software environments, negotiating APIs, and carrying out multi-step goals autonomously. The fundamental governance imperative of our era is ensuring these autonomous capabilities remain tightly aligned with shared human flourishing.',
+      youtubeSource: {
+        clipKey: 'yt_suleyman_ai',
+        url: 'https://www.youtube.com/watch?v=XpkEQK_Zqfg',
+        startTime: '00:25',
+        endTime: '01:40',
+        speaker: 'Mustafa Suleyman (DeepMind / Inflection AI)',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'ted', 'ai', 'technology'],
+    },
+    {
+      id: 'yt-laraboyd-brain',
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'TEDxVancouver — Dr. Lara Boyd',
+      prompt: 'After Watching This, Your Brain Will Not Be the Same: Neuroplasticity and Deliberate Practice (TEDx)',
+      sourceAudioText:
+        'Every single time you practice a difficult cognitive skill, generate spoken language under communicative pressure, or deliberate upon a novel grammatical structure, you are physically reconfiguring your brain. Neuroplasticity operates on three distinct timescales: chemical alterations that modulate neurotransmitter release, structural remodeling that strengthens synaptic connectivity, and functional reorganization that recruits adjacent cortical networks.',
+      youtubeSource: {
+        clipKey: 'yt_laraboyd_neuro',
+        url: 'https://www.youtube.com/watch?v=LNHBMFCzznE',
+        startTime: '00:30',
+        endTime: '01:45',
+        speaker: 'Dr. Lara Boyd (Neuroplasticity & Motor Learning)',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'ted', 'neuroscience', 'deliberate-practice'],
+    },
+    {
+      id: 'yt-treasure-speaking',
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'TED — Julian Treasure',
+      prompt: 'How to Speak So That People Want to Listen: Prosody, Register, and Vocal Resonance (TED)',
+      sourceAudioText:
+        'The human voice is the instrument we all play. It is the most powerful sound in the world, capable of starting wars or expressing love. Yet many speakers suffer from monotonic cadence and inadequate pause awareness. By calibrating register, timbre, prosodic rhythm, and purposeful silence, an orator commands subconscious cognitive presence.',
+      youtubeSource: {
+        clipKey: 'yt_treasure_speech',
+        url: 'https://www.youtube.com/watch?v=eIho2S0ZahI',
+        startTime: '00:20',
+        endTime: '01:35',
+        speaker: 'Julian Treasure (Sound & Communication Expert)',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'ted', 'speech', 'prosody'],
+    },
+    {
+      id: 'yt-cambridge-linguistics',
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'Cambridge University Faculty of Linguistics',
+      prompt: 'Suprasegmental Phonology and Clause-Boundary Pacing in High-Stakes Oral Production',
+      sourceAudioText:
+        'Advanced second language proficiency is characterized not merely by lexical breadth, but by the natural execution of suprasegmental features, including intonational pitch contours, tonic stress placement, and the tactical deployment of clause-boundary pauses that permit listeners to parse dense informational density in real time.',
+      youtubeSource: {
+        clipKey: 'yt_cambridge_ling',
+        url: 'https://www.youtube.com/watch?v=7pCskG_V45s',
+        startTime: '00:15',
+        endTime: '01:30',
+        speaker: 'Cambridge University Faculty of Linguistics',
+      },
+      difficulty: 'hard',
+      tags: ['shadowing', 'cambridge', 'linguistics', 'c2-proficiency'],
+    },
+
+    // =====================================================================
+    // 4. COLLOCATION CHUNK WRITING (SRS Multi-Word Chunks)
+    // =====================================================================
+    {
+      id: 'vw-chunks-ai-research',
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank',
+      prompt: 'Write an analytical paragraph on artificial intelligence in scientific research incorporating all 4 multi-word collocation chunks below.',
+      targetChunks: [
+        'rigorous empirical validation',
+        'shift the research paradigm',
+        'ubiquitous adoption of',
+        'bear the consequences',
+      ],
+      sampleAnswer:
+        'In modern computer science, the ubiquitous adoption of machine learning has begun to shift the research paradigm, requiring rigorous empirical validation so institutions do not bear the consequences of unverified automated models.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'academic', 'graduate'],
+    },
+    {
+      id: 'vw-chunks-algorithmic-governance',
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Collocation Bank',
+      prompt: 'Write a dense academic paragraph evaluating algorithmic governance and public policy using all 4 multi-word collocation chunks below.',
+      targetChunks: [
+        'as a consequence of',
+        'mitigate the unintended risks',
+        'regulatory frameworks must evolve',
+        'exercising due diligence',
+      ],
+      sampleAnswer:
+        'As a consequence of rapid deployment in critical infrastructure, regulatory frameworks must evolve in tandem with algorithmic auditing, ensuring that engineering teams are exercising due diligence to mitigate the unintended risks of systemic bias.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'policy'],
+    },
+    {
+      id: 'vw-chunks-climate-adaptation',
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'The Conversation — Climate Economics',
+      prompt: 'Write an academic paragraph on climate resilience and green technology financing using all 4 multi-word collocation chunks below.',
+      targetChunks: [
+        'pose an existential threat to',
+        'transition toward renewable infrastructure',
+        'economically viable alternatives',
+        'bridging the gap between',
+      ],
+      sampleAnswer:
+        'Because rising global temperatures pose an existential threat to agricultural stability, nations must accelerate their transition toward renewable infrastructure by subsidizing economically viable alternatives and bridging the gap between scientific innovation and civic policy.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'climate'],
+    },
+    {
+      id: 'vw-chunks-neurotechnology-ethics',
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'UNIDIR / The Conversation — Neurotech Ethics',
+      prompt: 'Write a C1/C2 paragraph analyzing commercial brain-computer interfaces and cognitive privacy using all 4 collocation chunks below.',
+      targetChunks: [
+        'blurring the boundaries between',
+        'unprecedented ethical dilemmas',
+        'safeguard cognitive liberty',
+        'susceptible to manipulation',
+      ],
+      sampleAnswer:
+        'As neural implants begin blurring the boundaries between biological cognition and machine intelligence, they introduce unprecedented ethical dilemmas, compelling lawmakers to safeguard cognitive liberty lest human decision-making become susceptible to manipulation.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'neuroscience'],
+    },
+    {
+      id: 'vw-chunks-cybersecurity-patching',
+      skill: 'writing',
+      type: 'write-about-photo',
+      sourceAttribution: 'DET C1/C2 Engineering Bank',
+      prompt: 'Write a technical policy paragraph on medical device cybersecurity and automated vulnerability patching using all 4 chunks below.',
+      targetChunks: [
+        'expose critical infrastructure to',
+        'automated static analysis',
+        'remediate security vulnerabilities',
+        'without compromising system reliability',
+      ],
+      sampleAnswer:
+        'Unpatched legacy software can expose critical infrastructure to catastrophic breaches; consequently, hospitals are integrating automated static analysis into their deployment pipelines to remediate security vulnerabilities without compromising system reliability.',
+      difficulty: 'hard',
+      tags: ['vocab', 'chunks', 'cybersecurity'],
+    },
+
+    // =====================================================================
+    // 5. INTERACTIVE WRITING (Argumentative & Analytical Prompts)
+    // =====================================================================
+    {
+      id: 'iw-education-ai-defense',
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Graduate Writing Bank',
+      prompt: 'Universities are increasingly replacing take-home essays with live oral defenses and proctored synthesis exams due to generative AI. Evaluate the pedagogical benefits and potential drawbacks of this shift for non-native English speakers.',
+      sampleAnswer:
+        'While oral defenses provide authentic verification of a student’s spontaneous synthesis capacity, they introduce severe anxiety barriers and disproportionately penalize non-native speakers who possess nuanced written syntax but struggle with real-time acoustic formulation.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'education', 'ai'],
+    },
+    {
+      id: 'iw-smartphone-bans-schools',
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Policy Writing Bank',
+      prompt: 'Several countries have enacted nationwide bans on smartphones in secondary schools. Defend whether digital restriction fosters deeper cognitive focus or impairs students from developing digital self-regulation.',
+      sampleAnswer:
+        'Although removing mobile notifications immediately curtails cognitive fragmentation during classroom instruction, outright bans fail to equip adolescents with the internal metacognitive strategies required to navigate hyper-connected professional environments.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'policy'],
+    },
+    {
+      id: 'iw-open-source-vs-proprietary-ai',
+      skill: 'writing',
+      type: 'interactive-writing',
+      sourceAttribution: 'DET Technology Writing Bank',
+      prompt: 'Open-weights artificial intelligence models democratize research access but risk malicious exploitation without centralized safety filters. Argue whether open-source AI weights should remain unrestricted.',
+      sampleAnswer:
+        'Democratizing model weights decentralizes scientific innovation and enables independent security auditing; however, unrestricted distribution prevents post-hoc remediation once an autonomous dual-use capability is downloaded by non-state actors.',
+      difficulty: 'hard',
+      tags: ['interactive-writing', 'technology'],
+    },
+
+    // =====================================================================
+    // 6. TIMED VERBATIM SPEAKING (90-Second Complex Argumentation)
+    // =====================================================================
+    {
+      id: 'sp-ai-security-tradeoffs',
+      skill: 'speaking',
+      type: 'speaking-sample',
+      sourceAttribution: 'DET High-Stakes Speaking Bank',
+      prompt: 'Should automated cybersecurity algorithms be permitted to deploy retaliatory countermeasures without human executive authorization? Speak for 90 seconds explaining the systemic risks and operational necessity.',
+      difficulty: 'hard',
+      tags: ['speaking', 'cybersecurity'],
+    },
+    {
+      id: 'sp-complex-architecture',
+      skill: 'speaking',
+      type: 'interactive-speaking',
+      sourceAttribution: 'DET High-Stakes Speaking Bank',
+      prompt: 'Discuss how transitioning legacy monolithic codebases into distributed microservices architectures impacts maintainability, debugging complexity, and developer cognitive load.',
+      difficulty: 'hard',
+      tags: ['speaking', 'software'],
+    },
+    {
+      id: 'sp-climate-computing-footprint',
+      skill: 'speaking',
+      type: 'speaking-sample',
+      sourceAttribution: 'DET High-Stakes Speaking Bank',
+      prompt: 'The computing resources required to train modern deep learning models double every few months. Analyze how tech conglomerates should balance aggressive model scale against national green grid commitments.',
+      difficulty: 'hard',
+      tags: ['speaking', 'climate'],
+    },
+    {
+      id: 'sp-neurotech-workplace',
+      skill: 'speaking',
+      type: 'interactive-speaking',
+      sourceAttribution: 'DET High-Stakes Speaking Bank',
+      prompt: 'Evaluate whether employers should ever be legally permitted to monitor employee brainwave fatigue or attention levels using wearable EEG headsets during remote work.',
+      difficulty: 'hard',
+      tags: ['speaking', 'ethics'],
+    },
+
+    // =====================================================================
+    // 7. ARGUELLES SHADOWING & DICTOGLOSS DRILLS
+    // =====================================================================
+    {
+      id: 'sh-static-analysis-critics',
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'SLA Engineering Shadowing Bank',
+      prompt: 'While automated static analysis accelerates vulnerability discovery across large codebases, human security critics remain indispensable for verifying complex business logic and preventing subtle authentication bypasses.',
+      sourceAudioText:
+        'While automated static analysis accelerates vulnerability discovery across large codebases, human security critics remain indispensable for verifying complex business logic and preventing subtle authentication bypasses.',
+      difficulty: 'hard',
+      tags: ['shadowing', 'sla', 'engineering'],
+    },
+    {
+      id: 'sh-bbc-mosquito-equilibrium',
+      skill: 'speaking',
+      type: 'read-aloud',
+      sourceAttribution: 'BBC Science Focus (Epidemiology)',
+      prompt: 'Deforestation fragments surrounding wildlife corridors, causing disease-carrying mosquitoes to permanently alter their host preferences and seek blood meals from nearby human settlements.',
+      sourceAudioText:
+        'Deforestation fragments surrounding wildlife corridors, causing disease-carrying mosquitoes to permanently alter their host preferences and seek blood meals from nearby human settlements.',
+      difficulty: 'hard',
+      tags: ['shadowing', 'bbc', 'biology'],
+    },
+    {
+      id: 'dg-sla-chunking',
+      skill: 'listening',
+      type: 'listen-and-type',
+      sourceAttribution: 'Second Language Acquisition Research',
+      prompt: 'Second language acquisition research indicates that grammatical accuracy emerges naturally when learners internalize multi-word collocation chunks as unified perceptual units rather than assembling individual words through explicit grammatical rules.',
+      sourceAudioText:
+        'Second language acquisition research indicates that grammatical accuracy emerges naturally when learners internalize multi-word collocation chunks as unified perceptual units rather than assembling individual words through explicit grammatical rules.',
+      sampleAnswer:
+        'Transitioning to advanced language proficiency depends on producing formulaic word chunks automatically under time constraints rather than consciously piecing together individual words.',
+      difficulty: 'hard',
+      tags: ['dictogloss', 'sla', 'pedagogy'],
+    },
+    {
+      id: 'dg-conversation-brain-capital',
+      skill: 'listening',
+      type: 'listen-and-type',
+      sourceAttribution: 'The Conversation (Neuroeconomics)',
+      prompt: 'Neuroeconomists argue that national economic productivity increasingly hinges on brain capital, prioritizing cognitive resilience, emotional regulation, and lifelong neuroplastic adaptability over traditional industrial manufacturing output.',
+      sourceAudioText:
+        'Neuroeconomists argue that national economic productivity increasingly hinges on brain capital, prioritizing cognitive resilience, emotional regulation, and lifelong neuroplastic adaptability over traditional industrial manufacturing output.',
+      sampleAnswer:
+        'Safeguarding cognitive health and neuroplastic resilience produces broad economic benefits by helping workers adapt effectively in an AI-driven economy.',
+      difficulty: 'hard',
+      tags: ['dictogloss', 'the-conversation', 'economics'],
+    },
+  ];
+}
+
+export class DETDatabase extends Dexie {
+  settings!: Table<Settings, string>;
+  questionBank!: Table<QuestionBankItem, string>;
+  evalPrompts!: Table<EvalPrompt, string>;
+  sessionTemplates!: Table<SessionTemplate, string>;
+  sessionRuns!: Table<SessionRun, string>;
+
+  constructor() {
+    super('det-prep-app');
+    this.version(1).stores({
+      settings: 'id',
+      questionBank: 'id, skill, type, difficulty, srs.nextReviewDate',
+      evalPrompts: 'id, appliesToType',
+      sessionTemplates: 'id, deletedAt',
+      sessionRuns: 'id, templateId, status, startedAt',
+    });
+
+    this.on('populate', () => {
+      void this.populateDefaults();
+    });
+  }
+
+  async populateDefaults(): Promise<void> {
+    const defaultSettings: Settings = {
+      id: 'app-settings',
+      geminiApiKey: '',
+      sttProvider: 'local-whisper',
+      localWhisperUrl: 'http://127.0.0.1:8000/transcribe',
+      localSttEndpoint: 'http://127.0.0.1:8000/transcribe',
+      autoAdvanceDefault: false,
+      instantFeedbackDefault: true,
+      srsDefaults: {
+        startEase: 2.5,
+        startIntervalDays: 1,
+      },
+    };
+    await this.settings.put(defaultSettings);
+
+    const readingEvalId = crypto.randomUUID();
+    const brainDumpEvalId = crypto.randomUUID();
+    const vocabEvalId = crypto.randomUUID();
+    const speakingEvalId = crypto.randomUUID();
+    const shadowingEvalId = crypto.randomUUID();
+    const dictoglossEvalId = crypto.randomUUID();
+    const mockEvalId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    await this.evalPrompts.bulkPut([
+      {
+        id: readingEvalId,
+        name: 'DET Interactive Reading & Cloze Evaluator (140-150)',
+        appliesToType: 'interactive-reading',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_WRITING_PROMPT,
+      },
+      {
+        id: brainDumpEvalId,
+        name: 'DET Brain-Dump & Outline Evaluator (140-150)',
+        appliesToType: 'brain-dump',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_WRITING_PROMPT,
+      },
+      {
+        id: vocabEvalId,
+        name: 'DET Collocation Chunk & Writing Evaluator (140-150)',
+        appliesToType: 'vocab-writing',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_WRITING_PROMPT,
+      },
+      {
+        id: speakingEvalId,
+        name: 'DET Timestamped Verbatim Speaking Evaluator (140-150)',
+        appliesToType: 'speaking',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_SPEAKING_PROMPT,
+      },
+      {
+        id: shadowingEvalId,
+        name: 'SLA Shadowing Prosody Evaluator (140-150)',
+        appliesToType: 'shadowing',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_SHADOWING_PROMPT,
+      },
+      {
+        id: dictoglossEvalId,
+        name: 'SLA Dictogloss Working-Memory Evaluator (140-150)',
+        appliesToType: 'dictogloss',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_DICTOGLOSS_PROMPT,
+      },
+      {
+        id: mockEvalId,
+        name: 'DET Mock Test Evaluator (140-150)',
+        appliesToType: 'mock-test',
+        scoreScale: 'det-0-160',
+        promptText: DEFAULT_WRITING_PROMPT,
+      },
+    ]);
+
+    await this.questionBank.bulkPut(buildRichQuestionBank());
+
+    await this.sessionTemplates.bulkPut([
+      {
+        id: 'tpl-reading-and-production',
+        name: 'DET Interactive Reading & Production Suite (BBC / The Conversation)',
+        description: 'Official Read & Complete (Letter Boxes) + 6-Step Interactive Reading + Collocation Chunk Writing + 90s Verbatim Speaking.',
+        blocks: [
+          {
+            id: crypto.randomUUID(),
+            name: '1. Read & Complete + Interactive Reading Suite',
+            type: 'interactive-reading',
+            durationSec: 8 * 60,
+            instructions: 'Practice the segmented letter-box Read & Complete passages and the 6-step Interactive Reading suites.',
+            autoAdvance: false,
+            evalPromptId: readingEvalId,
+          },
+          {
+            id: crypto.randomUUID(),
+            name: '2. Collocation Chunk Precision Writing (SRS)',
+            type: 'vocab-writing',
+            durationSec: 5 * 60,
+            instructions: 'Write a cohesive C1/C2 academic paragraph incorporating all required multi-word collocation chunks.',
+            autoAdvance: false,
+            evalPromptId: vocabEvalId,
+          },
+          {
+            id: crypto.randomUUID(),
+            name: '3. Timed Verbatim Speaking & Noticing Loop',
+            type: 'speaking',
+            durationSec: 2 * 60,
+            instructions: 'Speak for 90 seconds on the prompt. Review your timestamped pauses and immediately re-record to fix hesitations.',
+            autoAdvance: false,
+            evalPromptId: speakingEvalId,
+          },
+        ],
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: 'tpl-sla-deliberate-practice',
+        name: 'SLA Deliberate Practice Protocol (140-150 C1/C2)',
+        description: 'Arguelles Shadowing (TED Talks) -> Dictogloss Reconstruction -> Collocation Chunk Writing -> Timed Verbatim Speaking.',
+        blocks: [
+          {
+            id: crypto.randomUUID(),
+            name: '1. Motor-Auditory Shadowing (Arguelles Method)',
+            type: 'shadowing',
+            durationSec: 3 * 60,
+            instructions: 'Listen to the human TED/academic talk and speak simultaneously (lagging by 0.5s) to train rhythm, prosody, and automaticity.',
+            autoAdvance: false,
+            evalPromptId: shadowingEvalId,
+          },
+          {
+            id: crypto.randomUUID(),
+            name: '2. Dictogloss Working-Memory Reconstruction',
+            type: 'dictogloss',
+            durationSec: 4 * 60,
+            instructions: 'Listen to the passage while taking 2-4 word fragment notes, then reconstruct the core meaning using complex subordination.',
+            autoAdvance: false,
+            evalPromptId: dictoglossEvalId,
+          },
+          {
+            id: crypto.randomUUID(),
+            name: '3. Collocation Chunk Precision Writing (SRS)',
+            type: 'vocab-writing',
+            durationSec: 5 * 60,
+            instructions: 'Write a cohesive C1/C2 academic paragraph incorporating all required multi-word collocation chunks.',
+            autoAdvance: false,
+            evalPromptId: vocabEvalId,
+          },
+          {
+            id: crypto.randomUUID(),
+            name: '4. Timed Verbatim Speaking & Noticing Loop',
+            type: 'speaking',
+            durationSec: 2 * 60,
+            instructions: 'Speak for 90 seconds on the prompt. Review your timestamped pauses and immediately re-record to fix hesitations.',
+            autoAdvance: false,
+            evalPromptId: speakingEvalId,
+          },
+        ],
+        createdAt: now,
+        updatedAt: now,
+      },
+    ]);
+  }
+}
+
+export const db = new DETDatabase();
+
+export async function ensureDatabaseUpgraded(): Promise<void> {
+  // 0. Ensure localWhisperUrl always ends with /transcribe
+  const settings = await db.settings.get('app-settings');
+  if (settings) {
+    const fixedUrl =
+      !settings.localWhisperUrl || settings.localWhisperUrl === 'http://127.0.0.1:8000'
+        ? 'http://127.0.0.1:8000/transcribe'
+        : settings.localWhisperUrl;
+    if (fixedUrl !== settings.localWhisperUrl) {
+      await db.settings.put({ ...settings, localWhisperUrl: fixedUrl });
+    }
+  }
+
+  // 1. Seed all new questions by deterministic ID without losing custom user questions
+  const richItems = buildRichQuestionBank();
+  const existingQuestions = await db.questionBank.toArray();
+  const existingMap = new Map(existingQuestions.map((q) => [q.id, q]));
+
+  const toPut: QuestionBankItem[] = [];
+  for (const item of richItems) {
+    const existing = existingMap.get(item.id);
+    if (!existing) {
+      toPut.push(item);
+    } else if (
+      (item.youtubeSource && !existing.youtubeSource) ||
+      (item.readAndComplete && !existing.readAndComplete) ||
+      (item.interactiveReading && !existing.interactiveReading)
+    ) {
+      toPut.push({
+        ...existing,
+        youtubeSource: existing.youtubeSource ?? item.youtubeSource,
+        readAndComplete: existing.readAndComplete ?? item.readAndComplete,
+        interactiveReading: existing.interactiveReading ?? item.interactiveReading,
+      });
+    }
+  }
+  if (toPut.length > 0) {
+    await db.questionBank.bulkPut(toPut);
+  }
+
+  // 2. Ensure Interactive Reading eval prompt exists
+  const prompts = await db.evalPrompts.toArray();
+  let readingEvalId = prompts.find((p) => p.appliesToType === 'interactive-reading')?.id;
+  if (!readingEvalId) {
+    readingEvalId = crypto.randomUUID();
+    await db.evalPrompts.put({
+      id: readingEvalId,
+      name: 'DET Interactive Reading & Cloze Evaluator (140-150)',
+      appliesToType: 'interactive-reading',
+      scoreScale: 'det-0-160',
+      promptText: DEFAULT_WRITING_PROMPT,
+    });
+  }
+
+  // 3. Ensure the DET Interactive Reading & Production template exists
+  const templates = await db.sessionTemplates.toArray();
+  const hasReadingTemplate = templates.some((t) =>
+    t.blocks.some((b) => b.type === 'interactive-reading')
+  );
+  if (!hasReadingTemplate) {
+    const vocabEvalId =
+      prompts.find((p) => p.appliesToType === 'vocab-writing')?.id ?? readingEvalId;
+    const speakingEvalId =
+      prompts.find((p) => p.appliesToType === 'speaking')?.id ?? readingEvalId;
+    const now = new Date().toISOString();
+    await db.sessionTemplates.put({
+      id: 'tpl-reading-and-production',
+      name: 'DET Interactive Reading & Production Suite (BBC / The Conversation)',
+      description: 'Official Read & Complete (Letter Boxes) + 6-Step Interactive Reading + Collocation Chunk Writing + 90s Verbatim Speaking.',
+      blocks: [
+        {
+          id: crypto.randomUUID(),
+          name: '1. Read & Complete + Interactive Reading Suite',
+          type: 'interactive-reading',
+          durationSec: 8 * 60,
+          instructions: 'Practice the segmented letter-box Read & Complete passages and the 6-step Interactive Reading suites.',
+          autoAdvance: false,
+          evalPromptId: readingEvalId,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: '2. Collocation Chunk Precision Writing (SRS)',
+          type: 'vocab-writing',
+          durationSec: 5 * 60,
+          instructions: 'Write a cohesive C1/C2 academic paragraph incorporating all required multi-word collocation chunks.',
+          autoAdvance: false,
+          evalPromptId: vocabEvalId,
+        },
+        {
+          id: crypto.randomUUID(),
+          name: '3. Timed Verbatim Speaking & Noticing Loop',
+          type: 'speaking',
+          durationSec: 2 * 60,
+          instructions: 'Speak for 90 seconds on the prompt. Review your timestamped pauses and immediately re-record to fix hesitations.',
+          autoAdvance: false,
+          evalPromptId: speakingEvalId,
+        },
+      ],
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+}
+`,
+};
+
+const cwd = process.cwd();
+for (const [relPath, content] of Object.entries(files)) {
+  const targetPath = path.join(cwd, relPath);
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.writeFileSync(targetPath, content, 'utf8');
+  console.log('Phase 1 Updated:', path.relative(cwd, targetPath));
+}
+
+// Clean up the corrupted script if present
+const brokenScript = path.join(cwd, 'new-incomlete fix.mjs');
+if (fs.existsSync(brokenScript)) {
+  fs.unlinkSync(brokenScript);
+  console.log('Removed corrupted file: new-incomlete fix.mjs');
+}
+
+console.log('\nPhase 1 (Backend + Types + Database) applied successfully!');
