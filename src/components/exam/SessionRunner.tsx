@@ -8,11 +8,10 @@ import {
 } from '../../stores/sessionStore';
 import { TimerEngine } from '../../utils/timer';
 import { formatTime } from '../../utils/helpers';
-import { db } from '../../db/database';
+import { db, DEFAULT_SPEAKING_PROMPT } from '../../db/database';
 import { evaluateResponse } from '../../services/gemini';
 import { BlockInputRouter } from './BlockInputRouter';
 import { TransitionOverlay } from './TransitionOverlay';
-import { WhisperLiveIndicator } from '../common/WhisperLiveIndicator';
 
 export function SessionRunner() {
   const isRunning = useSessionStore((s) => s.isRunning);
@@ -23,7 +22,6 @@ export function SessionRunner() {
   const activeRun = useSessionStore((s) => s.activeRun);
   const draftResponses = useSessionStore((s) => s.draftResponses);
   const lastSavedAt = useSessionStore((s) => s.lastSavedAt);
-
   const tick = useSessionStore((s) => s.tick);
   const pauseSession = useSessionStore((s) => s.pauseSession);
   const resumeRunning = useSessionStore((s) => s.resumeRunning);
@@ -66,9 +64,12 @@ export function SessionRunner() {
   const handleInstantCheck = useCallback(async () => {
     if (!currentBlock) return;
     const resp = draftResponses[currentBlock.id];
-    const studentText = resp?.textOrTranscript?.trim() ?? '';
+    const studentText = (resp?.timestampedTranscript || resp?.textOrTranscript || '').trim();
+
     if (!studentText) {
-      setInstantEvalError('Write a response or record & transcribe your speech before requesting AI feedback.');
+      setInstantEvalError(
+        'Write a response or record & transcribe your speech before requesting AI feedback.'
+      );
       return;
     }
 
@@ -78,28 +79,35 @@ export function SessionRunner() {
 
     try {
       const settings = await db.settings.get('app-settings');
-      if (!settings?.geminiApiKey) {
-        throw new Error('Gemini API key not configured. Add it in Config -> Settings.');
-      }
       const evalPrompts = await db.evalPrompts.toArray();
-      const evalPrompt =
-        evalPrompts.find((ep) => ep.id === currentBlock.evalPromptId) ??
-        evalPrompts.find((ep) => ep.appliesToType === currentBlock.type) ??
-        evalPrompts[0];
-      if (!evalPrompt) throw new Error('No evaluation prompt found.');
+
+      // Detect if this block was answered via Spoken Voice Mode (including Spoken Collocation Drill!)
+      const isSpokenResponse =
+        currentBlock.type === 'speaking' ||
+        currentBlock.type === 'shadowing' ||
+        resp?.questionType === 'spoken-collocation-drill' ||
+        Boolean(resp?.audioBlobRef);
+
+      const evalPrompt = isSpokenResponse
+        ? evalPrompts.find((ep) => ep.appliesToType === 'speaking')
+        : evalPrompts.find((ep) => ep.id === currentBlock.evalPromptId) ??
+          evalPrompts.find((ep) => ep.appliesToType === currentBlock.type) ??
+          evalPrompts[0];
 
       const verifiedDuration =
-        resp?.audioDurationSec ?? (resp?.timeSpentSec && resp.timeSpentSec > 0 ? resp.timeSpentSec : currentBlock.durationSec);
+        resp?.audioDurationSec || resp?.timeSpentSec || 60;
 
       const feedback = await evaluateResponse({
-        apiKey: settings.geminiApiKey,
-        evalPromptTemplate: evalPrompt.promptText,
+        apiKey: settings?.geminiApiKey ?? '',
+        evalPromptTemplate:
+          evalPrompt?.promptText ??
+          (isSpokenResponse ? DEFAULT_SPEAKING_PROMPT : ''),
         variables: {
           prompt: resp?.promptSnapshot || currentBlock.instructions,
           response: studentText,
-          transcript: resp?.timestampedTranscript || studentText,
+          transcript: studentText,
           durationSec: String(verifiedDuration),
-          wpm: String(resp?.wpm ?? 130),
+          wpm: String(resp?.wpm ?? 0),
           fillerCount: String(resp?.fillerCount ?? 0),
         },
       });
@@ -110,14 +118,20 @@ export function SessionRunner() {
         aiSubscores: feedback.subscores,
       });
     } catch (err) {
-      setInstantEvalError(err instanceof Error ? err.message : 'Instant evaluation failed.');
+      setInstantEvalError(
+        err instanceof Error ? err.message : 'Instant evaluation failed.'
+      );
     } finally {
       setInstantEvalLoading(false);
     }
   }, [currentBlock, draftResponses, pauseSession, updateResponse]);
 
   const handleAbandon = useCallback(async () => {
-    if (window.confirm('Exit this practice session? Your draft responses remain saved in History.')) {
+    if (
+      window.confirm(
+        'Exit this practice session? Your draft responses remain saved in History.'
+      )
+    ) {
       await abandonSession();
     }
   }, [abandonSession]);
@@ -129,9 +143,18 @@ export function SessionRunner() {
   const isLowTime = blockTimeRemaining <= 60 && blockTimeRemaining > 0;
   const isCritical = blockTimeRemaining <= 10 && blockTimeRemaining > 0;
   const totalBlocks = activeRun.blockConfigs.length;
+  const nextBlock = activeRun.blockConfigs[currentBlockIndex + 1];
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50">
+      {transitionCountdown !== null && (
+        <TransitionOverlay
+          count={transitionCountdown}
+          nextBlockName={nextBlock?.name ?? 'Next Block'}
+        />
+      )}
+
+      {/* Sticky Top Header */}
       <header className="sticky top-0 z-30 bg-white border-b border-slate-200 shadow-xs">
         <div className="flex gap-1 px-2 pt-1.5">
           {activeRun.blockConfigs.map((block, i) => {
@@ -154,163 +177,174 @@ export function SessionRunner() {
             );
           })}
         </div>
-        <div className="flex items-center justify-between px-6 py-2.5">
+
+        <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-2.5">
           <div className="flex items-center gap-3">
-            <button
-              type="button"
-              onClick={handleAbandon}
-              className="text-xs font-semibold text-slate-600 hover:text-slate-900 bg-slate-100 border border-slate-200 px-2.5 py-1.5 rounded-lg cursor-pointer"
-            >
-              ← Exit
-            </button>
             <span className="text-xs font-bold text-primary-700 bg-primary-50 px-2.5 py-1 rounded-md">
               Block {currentBlockIndex + 1} / {totalBlocks}
             </span>
-            <span className="text-sm font-semibold text-slate-800">{currentBlock.name}</span>
-            {lastSavedAt && <span className="text-xs text-slate-400 hidden sm:inline">Auto-saved</span>}
+            <span className="text-sm font-semibold text-slate-800">
+              {currentBlock.name}
+            </span>
+            {currentResponse?.attemptCount && currentResponse.attemptCount > 1 && (
+              <span className="text-xs font-bold bg-accent-100 text-accent-800 px-2 py-0.5 rounded-full">
+                Attempt #{currentResponse.attemptCount}
+              </span>
+            )}
+            {lastSavedAt && (
+              <span className="text-[11px] text-slate-400 hidden sm:inline">
+                Auto-saved
+              </span>
+            )}
           </div>
+
           <div className="flex items-center gap-3">
-            <WhisperLiveIndicator compact />
-            <span className="text-xs text-slate-400 font-mono">Total {formatTime(overallElapsedSec)}</span>
-            <span
-              className={`text-base font-bold font-mono tabular-nums px-2.5 py-0.5 rounded ${
-                blockTimeRemaining === 0
-                  ? 'bg-red-100 text-red-700'
-                  : isCritical
-                  ? 'bg-red-50 text-red-600 timer-warning'
+            <span className="text-xs text-slate-400 hidden md:inline">
+              Total: {formatTime(overallElapsedSec)}
+            </span>
+
+            <div
+              className={`px-3 py-1 rounded-lg font-mono text-base font-bold ${
+                isCritical
+                  ? 'bg-red-600 text-white animate-pulse'
                   : isLowTime
-                  ? 'bg-amber-50 text-amber-600'
-                  : 'text-slate-800'
+                  ? 'bg-amber-100 text-amber-800'
+                  : 'bg-slate-100 text-slate-800'
               }`}
             >
-              {blockTimeRemaining === 0 ? 'TIME UP' : formatTime(blockTimeRemaining)}
-            </span>
+              {formatTime(blockTimeRemaining)}
+            </div>
+
+            <button
+              type="button"
+              onClick={isPaused ? resumeRunning : pauseSession}
+              className="px-3 py-1.5 text-xs font-semibold border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+            >
+              {isPaused ? '▶ Resume' : '⏸ Pause'}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleAbandon}
+              className="px-2.5 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 rounded-lg cursor-pointer"
+            >
+              Exit
+            </button>
           </div>
         </div>
       </header>
 
-      <div className="flex-1 max-w-3xl w-full mx-auto px-6 py-6 space-y-6">
+      {/* Main Content */}
+      <main className="flex-1 max-w-4xl w-full mx-auto px-6 py-6 space-y-6">
         <BlockInputRouter block={currentBlock} />
 
         {instantEvalError && (
-          <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl p-3">
+          <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-xs text-red-700">
             {instantEvalError}
           </div>
         )}
 
-        {/* Write-Critique-Rewrite / Noticing Hypothesis Feedback Drawer */}
+        {/* Instant AI Feedback Drawer */}
         {blockFeedback && (
-          <div className="bg-white border-2 border-primary-400 rounded-2xl p-5 shadow-md space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+          <div className="bg-white border-2 border-primary-300 rounded-2xl p-5 space-y-4 shadow-sm">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
               <div>
-                <span className="text-xs font-bold uppercase tracking-wider text-primary-600">
-                  Noticing Hypothesis Loop • Attempt #{currentResponse?.attemptCount ?? 1}
+                <span className="text-xs font-bold uppercase tracking-wider text-primary-700">
+                  ⚡ Instant Deliberate-Practice Critique
                 </span>
-                <h4 className="text-base font-bold text-slate-900">
-                  Instant DET Calibration (Verified Duration: {currentResponse?.audioDurationSec ?? currentResponse?.timeSpentSec ?? 0}s)
+                <h4 className="text-base font-bold text-slate-900 mt-0.5">
+                  Estimated DET Band: {blockFeedback.overallScore ?? '—'} / 160
                 </h4>
               </div>
-              <div className="text-right">
-                <span className="text-3xl font-black text-primary-600">
-                  {currentResponse?.aiOverallScore ?? '—'}
-                </span>
-                <span className="text-xs text-slate-400 block">/ 160</span>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => resetBlockForRewrite(currentBlock.id)}
+                  className="px-4 py-2 bg-accent-600 hover:bg-accent-700 text-white text-xs font-bold rounded-xl cursor-pointer shadow-2xs"
+                >
+                  ↺ Apply Fixes & Rewrite / Re-record Now
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDone}
+                  className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl cursor-pointer"
+                >
+                  {isLastBlock ? 'Finish Session →' : 'Continue to Next Block →'}
+                </button>
               </div>
             </div>
 
-            {blockFeedback.suggestedFix && (
-              <div className="bg-primary-50 border border-primary-200 rounded-xl p-3.5">
-                <p className="text-xs font-bold text-primary-800 mb-1">
-                  145–155 Band Target Upgrade (Incorporate this into your next attempt):
-                </p>
-                <p className="text-xs text-slate-800 leading-relaxed">{blockFeedback.suggestedFix}</p>
-              </div>
+            {blockFeedback.note && (
+              <p className="text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-3 py-1.5 rounded-lg">
+                ℹ️ {blockFeedback.note}
+              </p>
             )}
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
               {blockFeedback.strengths.length > 0 && (
-                <div className="bg-green-50 rounded-lg p-3">
-                  <p className="font-bold text-green-800 mb-1">Strengths</p>
-                  <ul className="list-disc list-inside space-y-1 text-slate-700">
-                    {blockFeedback.strengths.map((s, idx) => (
-                      <li key={idx}>{s}</li>
+                <div className="bg-green-50 border border-green-200 rounded-xl p-3">
+                  <strong className="text-green-900 block mb-1">✓ Strengths</strong>
+                  <ul className="list-disc list-inside space-y-1 text-green-800">
+                    {blockFeedback.strengths.map((s, i) => (
+                      <li key={i}>{s}</li>
                     ))}
                   </ul>
                 </div>
               )}
               {blockFeedback.weaknesses.length > 0 && (
-                <div className="bg-amber-50 rounded-lg p-3">
-                  <p className="font-bold text-amber-800 mb-1">Gaps to Fix in Rewrite/Re-record</p>
-                  <ul className="list-disc list-inside space-y-1 text-slate-700">
-                    {blockFeedback.weaknesses.map((w, idx) => (
-                      <li key={idx}>{w}</li>
+                <div className="bg-red-50 border border-red-200 rounded-xl p-3">
+                  <strong className="text-red-900 block mb-1">⚠️ Gaps to Fix</strong>
+                  <ul className="list-disc list-inside space-y-1 text-red-800">
+                    {blockFeedback.weaknesses.map((w, i) => (
+                      <li key={i}>{w}</li>
                     ))}
                   </ul>
                 </div>
               )}
             </div>
 
-            <div className="flex flex-wrap items-center justify-end gap-2 pt-2 border-t border-slate-100">
-              <button
-                type="button"
-                onClick={() => resetBlockForRewrite(currentBlock.id)}
-                className="px-4 py-2 text-xs font-bold bg-primary-600 text-white rounded-lg hover:bg-primary-700 cursor-pointer shadow-xs"
-              >
-                {currentBlock.type === 'speaking' || currentBlock.type === 'shadowing'
-                  ? '↻ Apply Fixes & Re-Record Now (Deliberate Practice)'
-                  : '↻ Clear & Rewrite Using 150-Band Upgrade'}
-              </button>
-              <button
-                type="button"
-                onClick={resumeRunning}
-                className="px-4 py-2 text-xs font-semibold bg-slate-900 text-white rounded-lg hover:bg-slate-800 cursor-pointer"
-              >
-                Resume Timer
-              </button>
-            </div>
+            {blockFeedback.suggestedFix && (
+              <div className="bg-primary-50 border border-primary-200 rounded-xl p-3.5 text-xs text-slate-900">
+                <strong className="text-primary-800 block mb-1">
+                  ✨ 150-Band C1/C2 Target Rewrite:
+                </strong>
+                <p className="italic leading-relaxed">{blockFeedback.suggestedFix}</p>
+              </div>
+            )}
           </div>
         )}
-      </div>
+      </main>
 
-      <footer className="sticky bottom-0 z-30 bg-white border-t border-slate-200 px-6 py-3 flex flex-wrap items-center justify-between gap-3">
-        <button
-          onClick={handleAbandon}
-          className="text-xs font-medium text-slate-400 hover:text-red-600"
-        >
-          Exit Session
-        </button>
-        <div className="flex items-center gap-2.5">
-          <button
-            type="button"
-            onClick={handleInstantCheck}
-            disabled={instantEvalLoading}
-            className="px-4 py-2 text-xs font-semibold text-accent-700 bg-accent-50 border border-accent-200 rounded-lg hover:bg-accent-100 disabled:opacity-50 cursor-pointer"
-          >
-            {instantEvalLoading ? 'Grading Block...' : 'Instant AI Feedback'}
-          </button>
-          <button
-            type="button"
-            onClick={isPaused ? resumeRunning : pauseSession}
-            className="px-4 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 cursor-pointer"
-          >
-            {isPaused ? 'Resume Timer' : 'Pause'}
-          </button>
+      {/* Bottom Action Footer */}
+      <footer className="sticky bottom-0 z-30 bg-white border-t border-slate-200 px-6 py-3.5">
+        <div className="max-w-4xl mx-auto flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            {activeRun.instantFeedback && currentBlock.type !== 'interactive-reading' && (
+              <button
+                type="button"
+                disabled={instantEvalLoading}
+                onClick={() => void handleInstantCheck()}
+                className="px-4 py-2.5 bg-accent-600 hover:bg-accent-700 text-white text-xs font-bold rounded-xl disabled:opacity-50 cursor-pointer shadow-2xs"
+              >
+                {instantEvalLoading
+                  ? '⏳ Grading Response...'
+                  : '⚡ Get Instant AI Critique & Score'}
+              </button>
+            )}
+          </div>
+
           <button
             type="button"
             onClick={handleDone}
-            className="px-5 py-2 bg-primary-600 text-white text-xs font-bold rounded-lg hover:bg-primary-700 cursor-pointer"
+            className="px-6 py-2.5 bg-primary-600 hover:bg-primary-700 text-white text-sm font-bold rounded-xl cursor-pointer shadow-xs"
           >
-            {isLastBlock ? 'Finish & Review Session →' : 'Next Block →'}
+            {isLastBlock
+              ? '✓ Complete Session & View Final Score'
+              : `Next Block (${currentBlockIndex + 2}/${totalBlocks}) →`}
           </button>
         </div>
       </footer>
-
-      {transitionCountdown !== null && (
-        <TransitionOverlay
-          count={transitionCountdown}
-          nextBlockName={activeRun.blockConfigs[currentBlockIndex]?.name}
-        />
-      )}
     </div>
   );
 }

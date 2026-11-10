@@ -75,31 +75,48 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
     setCompletedIds(doneSet);
 
     let manifest: Record<string, { audioUrl: string; text: string }> = {};
+    let backendOnline = false;
     try {
       const res = await fetch(`${BACKEND_BASE}/audio/manifest`);
       if (res.ok) {
+        backendOnline = true;
         manifest = (await res.json()) as Record<string, { audioUrl: string; text: string }>;
       }
     } catch {
-      // Backend offline or manifest empty
+      backendOnline = false;
     }
 
     const updatedItems: QuestionBankItem[] = [];
     for (const q of all) {
-      if (q.youtubeSource?.clipKey && manifest[q.youtubeSource.clipKey] && !q.audioUrl) {
-        const cached = manifest[q.youtubeSource.clipKey];
+      const clipKey = q.youtubeSource?.clipKey;
+      // CRITICAL FIX: Always sync both audioUrl AND verbatim transcript from manifest
+      // even if q.audioUrl was already set, so the on-screen text ALWAYS matches the MP3 voice!
+      if (clipKey && manifest[clipKey]) {
+        const cached = manifest[clipKey];
+        const cleanAudioUrl = normalizeAudioUrl(cached.audioUrl);
+        const verbatimTranscript = cached.text?.trim() || q.sourceAudioText || q.prompt;
         const upgraded: QuestionBankItem = {
           ...q,
-          audioUrl: normalizeAudioUrl(cached.audioUrl),
-          sourceAudioText: cached.text || q.sourceAudioText,
-          prompt: cached.text || q.prompt,
+          audioUrl: cleanAudioUrl,
+          sourceAudioText: verbatimTranscript,
+          prompt: verbatimTranscript,
         };
-        await db.questionBank.put(upgraded);
+        if (
+          q.audioUrl !== cleanAudioUrl ||
+          q.sourceAudioText !== verbatimTranscript ||
+          q.prompt !== verbatimTranscript
+        ) {
+          await db.questionBank.put(upgraded);
+        }
         updatedItems.push(upgraded);
       } else {
+        // If backend is offline or clip is not in manifest, clear stale localhost audioUrl
+        // so browser TTS speaks the exact on-screen text instead of playing a broken/mismatched file
+        const hasValidLocalAudio =
+          backendOnline && q.audioUrl && !clipKey ? normalizeAudioUrl(q.audioUrl) : '';
         updatedItems.push({
           ...q,
-          audioUrl: q.audioUrl ? normalizeAudioUrl(q.audioUrl) : q.audioUrl,
+          audioUrl: hasValidLocalAudio || undefined,
         });
       }
     }
@@ -113,7 +130,6 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
         Boolean(q.sourceAudioText)
     );
 
-    // Sort UNSEEN items first, then by human audio availability
     shadowItems.sort((a, b) => {
       const aDone = doneSet.has(a.id) ? 1 : 0;
       const bDone = doneSet.has(b.id) ? 1 : 0;
@@ -185,11 +201,12 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
         audioUrl: string;
         text: string;
       };
+      const verbatim = data.text?.trim() || currentItem.sourceAudioText || currentItem.prompt;
       const updatedItem: QuestionBankItem = {
         ...currentItem,
         audioUrl: normalizeAudioUrl(data.audioUrl),
-        sourceAudioText: data.text || currentItem.sourceAudioText,
-        prompt: data.text || currentItem.prompt,
+        sourceAudioText: verbatim,
+        prompt: verbatim,
       };
       await db.questionBank.put(updatedItem);
       setPassages((prev) =>
@@ -327,10 +344,10 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
             }`}
           >
             {humanAudioUrl
-              ? '🎙️ Real Human Audio Ready on Device'
+              ? '🎙️ Real Human Audio + Verbatim Whisper Transcript Synced'
               : ytSource
               ? `🎬 Curated YouTube Talk: ${ytSource.speaker}`
-              : '⚠️ Synthetic TTS Fallback'}
+              : '🔊 Browser Voice (Matches On-Screen Text)'}
           </span>
         </div>
 
@@ -380,7 +397,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
               🎬 Curated TED / Academic Talk Linked ({ytSource.speaker} • {ytSource.startTime}–{ytSource.endTime})
             </p>
             <p className="text-xs text-slate-600 mt-0.5">
-              Click once to auto-download this real human audio slice to your device and transcribe it with Faster-Whisper.
+              Currently using Browser Voice for the text below, or click once to download the real human MP3 + exact Faster-Whisper transcript.
             </p>
           </div>
           <button
@@ -391,7 +408,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
           >
             {downloadingYt
               ? '⏳ Downloading & Transcribing via GPU...'
-              : '⬇️ Auto-Download Human Audio to Device'}
+              : '⬇️ Download Real Human Audio + Exact Transcript'}
           </button>
         </div>
       )}
@@ -435,20 +452,18 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
             >
               {hideTranscript ? 'Show Transcript' : 'Blind Shadowing (Hide Text)'}
             </button>
-            {!humanAudioUrl && (
-              <button
-                type="button"
-                onClick={isPlayingAudio ? stopNativeAudio : playNativeAudio}
-                className="text-xs font-semibold px-3 py-1 rounded-lg bg-white border border-primary-300 text-primary-800"
-              >
-                {isPlayingAudio ? 'Stop Audio' : 'Preview Audio'}
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={isPlayingAudio ? stopNativeAudio : playNativeAudio}
+              className="text-xs font-semibold px-3 py-1 rounded-lg bg-white border border-primary-300 text-primary-800 cursor-pointer"
+            >
+              {isPlayingAudio ? '⏹ Stop Audio' : '🔊 Preview Audio'}
+            </button>
           </div>
         </div>
         {hideTranscript ? (
           <p className="text-sm italic text-slate-500 py-4 text-center">
-            Transcript hidden for pure auditory-motor shadowing. Listen closely to the human speaker's intonation!
+            Transcript hidden for pure auditory-motor shadowing. Listen closely to the speaker's intonation!
           </p>
         ) : (
           <p className="text-base text-slate-900 leading-relaxed font-medium">{sourceText}</p>
@@ -463,7 +478,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
             className="px-7 py-4 rounded-2xl bg-red-600 hover:bg-red-700 text-white font-bold text-sm shadow-lg cursor-pointer flex items-center gap-3"
           >
             <span className="w-3 h-3 rounded-full bg-white animate-ping" />
-            Play Human Audio & Record Your Shadowing Simultaneously
+            Play Audio & Record Your Shadowing Simultaneously
           </button>
         )}
         {recordingState === 'recording' && (

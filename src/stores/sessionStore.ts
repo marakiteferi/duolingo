@@ -17,7 +17,7 @@ export interface StartSessionOptions {
   communicativePressure?: boolean;
   preferredQuestionType?: DETQuestionType | 'all' | 'adaptive';
   planDay?: number;
-  planSlotIndex?: number; // 1, 2, or 3
+  planSlotIndex?: number;
 }
 
 interface SessionState {
@@ -38,9 +38,11 @@ interface SessionActions {
   resumeSession: (run: SessionRun) => void;
   tick: () => void;
   advanceBlock: () => void;
+  skipTransition: () => void;
   jumpToBlock: (index: number) => void;
   completeBlock: () => void;
   updateResponse: (blockId: string, patch: Partial<BlockResponse>) => void;
+  resetBlockForRewrite: (blockId?: string) => void;
   pauseSession: () => void;
   resumeRunning: () => void;
   completeSession: () => Promise<void>;
@@ -155,20 +157,33 @@ export const useSessionStore = create<SessionState & SessionActions>()(
     },
 
     resumeSession: (run) => {
-      const activeBlock = run.blockConfigs[run.currentBlockIndex];
+      const safeIndex = Math.min(
+        Math.max(0, run.currentBlockIndex),
+        Math.max(0, run.blockConfigs.length - 1)
+      );
+      const activeBlock = run.blockConfigs[safeIndex];
       const savedBlockTime = activeBlock
         ? (run.responses[activeBlock.id]?.timeSpentSec ?? 0)
         : 0;
       set({
-        activeRun: run,
-        currentBlockIndex: run.currentBlockIndex,
-        blockElapsedSec: savedBlockTime,
-        overallElapsedSec: run.overallElapsedSec,
+        activeRun: { ...run, status: 'in-progress' },
+        currentBlockIndex: safeIndex,
+        blockElapsedSec: Math.min(savedBlockTime, Math.max(0, (activeBlock?.durationSec ?? 60) - 1)),
+        overallElapsedSec: run.overallElapsedSec ?? 0,
         isRunning: true,
         isPaused: false,
         transitionCountdown: null,
         draftResponses: { ...run.responses },
         lastSavedAt: new Date().toISOString(),
+      });
+    },
+
+    skipTransition: () => {
+      set({
+        transitionCountdown: null,
+        blockElapsedSec: 0,
+        isPaused: false,
+        isRunning: true,
       });
     },
 
@@ -242,6 +257,8 @@ export const useSessionStore = create<SessionState & SessionActions>()(
           overallElapsedSec: newOverall,
           draftResponses: updatedResponses,
           transitionCountdown: TRANSITION_SEC,
+          isPaused: false,
+          isRunning: true,
         });
         void get().persistToDb();
         return;
@@ -270,7 +287,7 @@ export const useSessionStore = create<SessionState & SessionActions>()(
           Boolean(
             currentResp.textOrTranscript?.trim() ||
               currentResp.audioBlobRef ||
-              currentResp.aiOverallScore
+              currentResp.aiOverallScore !== undefined
           )
         ) {
           void markQuestionCompleted(currentResp.questionId);
@@ -293,10 +310,14 @@ export const useSessionStore = create<SessionState & SessionActions>()(
         return;
       }
 
+      // CRITICAL FIX: Always unpause (isPaused: false, isRunning: true) when advancing
+      // so the 3-2-1 transition countdown never freezes after Instant Feedback!
       set({
         currentBlockIndex: state.currentBlockIndex + 1,
         blockElapsedSec: 0,
         transitionCountdown: TRANSITION_SEC,
+        isPaused: false,
+        isRunning: true,
       });
       void get().persistToDb();
     },
@@ -309,8 +330,10 @@ export const useSessionStore = create<SessionState & SessionActions>()(
       const priorSpent = state.draftResponses[targetBlock.id]?.timeSpentSec ?? 0;
       set({
         currentBlockIndex: index,
-        blockElapsedSec: Math.min(priorSpent, targetBlock.durationSec - 1),
+        blockElapsedSec: Math.min(priorSpent, Math.max(0, targetBlock.durationSec - 1)),
         transitionCountdown: null,
+        isPaused: false,
+        isRunning: true,
       });
       void get().persistToDb();
     },
@@ -354,6 +377,44 @@ export const useSessionStore = create<SessionState & SessionActions>()(
       void get().persistToDb();
     },
 
+    resetBlockForRewrite: (blockId?: string) => {
+      const state = get();
+      const activeBlock = state.activeRun?.blockConfigs[state.currentBlockIndex];
+      const targetId = blockId ?? activeBlock?.id;
+      if (!targetId) return;
+
+      const existing = state.draftResponses[targetId];
+      const isAudioBlock =
+        activeBlock?.type === 'speaking' || activeBlock?.type === 'shadowing';
+
+      set({
+        blockElapsedSec: 0,
+        isPaused: false,
+        isRunning: true,
+        draftResponses: {
+          ...state.draftResponses,
+          [targetId]: {
+            ...existing,
+            blockId: targetId,
+            previousDraft:
+              existing?.timestampedTranscript ||
+              existing?.textOrTranscript ||
+              existing?.previousDraft,
+            attemptCount: (existing?.attemptCount ?? 1) + 1,
+            audioBlobRef: isAudioBlock ? undefined : existing?.audioBlobRef,
+            textOrTranscript: isAudioBlock ? '' : (existing?.textOrTranscript ?? ''),
+            timestampedTranscript: isAudioBlock ? undefined : existing?.timestampedTranscript,
+            aiFeedback: undefined,
+            aiOverallScore: undefined,
+            aiSubscores: undefined,
+            isComplete: false,
+            timeSpentSec: 0,
+          },
+        },
+      });
+      void get().persistToDb();
+    },
+
     pauseSession: () => set({ isPaused: true }),
     resumeRunning: () => set({ isPaused: false }),
 
@@ -362,21 +423,19 @@ export const useSessionStore = create<SessionState & SessionActions>()(
       if (!state.activeRun) return;
       const now = new Date().toISOString();
 
-      // Mark all answered questions in this session as completed
       for (const resp of Object.values(state.draftResponses)) {
         if (
           resp.questionId &&
           Boolean(
             resp.textOrTranscript?.trim() ||
               resp.audioBlobRef ||
-              resp.aiOverallScore
+              resp.aiOverallScore !== undefined
           )
         ) {
           await markQuestionCompleted(resp.questionId);
         }
       }
 
-      // Record daily study plan slot completion if applicable
       const planDay = state.activeRun.planDay;
       const slotIdx =
         state.activeRun.planSlotIndex ??

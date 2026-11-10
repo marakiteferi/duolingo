@@ -3,6 +3,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useCallback,
   type KeyboardEvent,
   type ChangeEvent,
 } from 'react';
@@ -12,7 +13,13 @@ import {
   getCompletedQuestionIds,
   markQuestionCompleted,
 } from '../../../utils/adaptive';
-import type { BlockConfig, QuestionBankItem, ReadAndCompleteBlank } from '../../../types';
+import type {
+  BlockConfig,
+  QuestionBankItem,
+  ReadAndCompleteBlank,
+  ReadAndCompleteData,
+  InteractiveReadingData,
+} from '../../../types';
 
 const STEP_LABELS = [
   '1. Complete the Sentences',
@@ -22,6 +29,192 @@ const STEP_LABELS = [
   '5. Identify the Idea',
   '6. Title the Passage',
 ];
+
+function computeReadAndCompleteEvaluation(
+  rc: ReadAndCompleteData,
+  activeItem: QuestionBankItem,
+  inputs: Record<string, string>
+) {
+  let earned = 0;
+  const total = rc.blanks.length;
+  const missedWords: string[] = [];
+
+  for (const b of rc.blanks) {
+    const userSuffix = (inputs[b.id] ?? '').trim().toLowerCase();
+    if (userSuffix === b.missingSuffix.toLowerCase()) {
+      earned += 1;
+    } else {
+      missedWords.push(
+        `${b.prefix}[${b.missingSuffix}] (you typed: "${b.prefix}${userSuffix || '___'}")`
+      );
+    }
+  }
+
+  const accuracy = earned / Math.max(1, total);
+  const detScore = Math.round(65 + accuracy * 95);
+  const summaryTranscript = `[Read and Complete — ${rc.title} (${rc.sourceName})] Score: ${earned}/${total} (${Math.round(
+    accuracy * 100
+  )}%) -> DET Band ${detScore}/160. ${
+    missedWords.length > 0
+      ? 'Missed words: ' + missedWords.join(', ')
+      : 'All boxed words completed with 100% accuracy!'
+  }`;
+
+  return {
+    earned,
+    total,
+    detScore,
+    missedWords,
+    patch: {
+      questionId: activeItem.id,
+      questionType: 'read-and-complete',
+      promptSnapshot: activeItem.prompt,
+      textOrTranscript: summaryTranscript,
+      aiOverallScore: detScore,
+      aiSubscores: {
+        literacy: detScore,
+        comprehension: detScore,
+        conversation: Math.max(60, detScore - 5),
+        production: Math.max(60, detScore - 5),
+      },
+      aiFeedback: {
+        overallScore: detScore,
+        subscores: {
+          literacy: detScore,
+          comprehension: detScore,
+          conversation: Math.max(60, detScore - 5),
+          production: Math.max(60, detScore - 5),
+        },
+        criteria: {
+          lexical_cloze: `${earned} / ${total} boxed words correct (${Math.round(accuracy * 100)}%)`,
+          passage: rc.title,
+        },
+        strengths:
+          earned >= total - 1
+            ? ['Excellent orthographic & collocation recall under time pressure']
+            : [`Completed ${earned} of ${total} word completions accurately`],
+        weaknesses: missedWords,
+        suggestions: [
+          'Pay attention to grammatical suffixes (-tion, -ive, -ly, -ments) and exact letter box counts.',
+        ],
+      },
+    },
+  };
+}
+
+function computeInteractiveReadingEvaluation(
+  ir: InteractiveReadingData,
+  activeItem: QuestionBankItem,
+  state: {
+    clozeAnswers: Record<string, string>;
+    selectedGapSentence: string;
+    highlighted1: string;
+    highlighted2: string;
+    selectedIdea: string;
+    selectedTitle: string;
+  }
+) {
+  let earned = 0;
+  const totalPossible = ir.blanks.length + 5;
+  const wrongDetails: string[] = [];
+  const rightDetails: string[] = [];
+
+  for (const b of ir.blanks) {
+    if (state.clozeAnswers[b.id] === b.correctAnswer) {
+      earned += 1;
+    } else {
+      wrongDetails.push(
+        `Blank [${b.id}]: chose "${state.clozeAnswers[b.id] || 'none'}" (Correct: "${b.correctAnswer}")`
+      );
+    }
+  }
+  if (earned === ir.blanks.length) {
+    rightDetails.push('Perfect lexical precision on Step 1 (Complete the Sentences).');
+  }
+
+  if (state.selectedGapSentence === ir.correctPassageGap) {
+    earned += 1;
+    rightDetails.push('Correctly bridged discourse transition in Step 2 (Complete the Passage).');
+  } else {
+    wrongDetails.push('Missed discourse transition sentence in Step 2 (Complete the Passage).');
+  }
+
+  if (state.highlighted1.trim() === ir.correctHighlight1.trim()) {
+    earned += 1;
+    rightDetails.push('Pinpointed exact factual evidence in Step 3 (Highlight the Answer #1).');
+  } else {
+    wrongDetails.push('Inaccurate sentence selection on Step 3 (Highlight the Answer #1).');
+  }
+
+  if (state.highlighted2.trim() === ir.correctHighlight2.trim()) {
+    earned += 1;
+    rightDetails.push('Pinpointed exact factual evidence in Step 4 (Highlight the Answer #2).');
+  } else {
+    wrongDetails.push('Inaccurate sentence selection on Step 4 (Highlight the Answer #2).');
+  }
+
+  if (state.selectedIdea === ir.correctMainIdea) {
+    earned += 1;
+    rightDetails.push('Identified primary macro-thesis in Step 5 (Identify the Idea).');
+  } else {
+    wrongDetails.push('Missed main idea synthesis in Step 5 (Identify the Idea).');
+  }
+
+  if (state.selectedTitle === ir.correctTitle) {
+    earned += 1;
+  } else {
+    wrongDetails.push('Selected suboptimal academic title in Step 6.');
+  }
+
+  const accuracy = earned / Math.max(1, totalPossible);
+  const detScore = Math.round(65 + accuracy * 95);
+
+  const summaryTranscript = [
+    `[Interactive Reading — ${ir.sourceName}]`,
+    `Accuracy: ${earned}/${totalPossible} (${Math.round(accuracy * 100)}%) -> DET Band ${detScore}/160`,
+    wrongDetails.length > 0
+      ? `Mistakes: ${wrongDetails.join(' | ')}`
+      : 'Zero errors across all 6 steps!',
+  ].join('\n');
+
+  return {
+    earned,
+    totalPossible,
+    detScore,
+    patch: {
+      questionId: activeItem.id,
+      questionType: 'interactive-reading',
+      promptSnapshot: activeItem.prompt,
+      textOrTranscript: summaryTranscript,
+      aiOverallScore: detScore,
+      aiSubscores: {
+        literacy: detScore,
+        comprehension: detScore,
+        conversation: Math.max(60, detScore - 5),
+        production: Math.max(60, detScore - 5),
+      },
+      aiFeedback: {
+        overallScore: detScore,
+        subscores: {
+          literacy: detScore,
+          comprehension: detScore,
+          conversation: Math.max(60, detScore - 5),
+          production: Math.max(60, detScore - 5),
+        },
+        criteria: {
+          reading_accuracy: `${earned} / ${totalPossible} items correct (${Math.round(accuracy * 100)}%)`,
+          source: ir.sourceName,
+        },
+        strengths:
+          rightDetails.length > 0 ? rightDetails : ['Completed interactive reading suite'],
+        weaknesses: wrongDetails,
+        suggestions: [
+          'Pay close attention to discourse markers (however, consequently, whereas) when bridging paragraphs.',
+        ],
+      },
+    },
+  };
+}
 
 function SegmentedWordBlank({
   blank,
@@ -201,7 +394,6 @@ export function InteractiveReadingBlock({
           (q.type === 'interactive-reading' || q.type === 'read-and-complete')
       );
 
-      // Sort UNSEEN passages first, then by assigned 21-day plan dayNumber
       readingItems.sort((a, b) => {
         const aDone = doneSet.has(a.id) ? 1 : 0;
         const bDone = doneSet.has(b.id) ? 1 : 0;
@@ -235,6 +427,63 @@ export function InteractiveReadingBlock({
   const ir = activeItem?.interactiveReading;
   const rc = activeItem?.readAndComplete;
 
+  // CRITICAL FIX: Auto-save & auto-grade Read & Complete whenever any letter box changes
+  // so that even if the user clicks "Next Block" without clicking "Check Answers",
+  // the full evaluation & DET score are already recorded in draftResponses!
+  const syncReadAndCompleteToStore = useCallback(
+    (nextInputs: Record<string, string>, markDone: boolean) => {
+      if (!rc || !activeItem) return;
+      const hasAnyTyped = Object.values(nextInputs).some((v) => v.trim().length > 0);
+      if (!hasAnyTyped && !markDone) return;
+
+      const evalData = computeReadAndCompleteEvaluation(rc, activeItem, nextInputs);
+      updateResponse(block.id, evalData.patch);
+
+      if (markDone || Object.values(nextInputs).filter((v) => v.trim().length > 0).length >= 3) {
+        void markQuestionCompleted(activeItem.id);
+        setCompletedIds((prev) => new Set(prev).add(activeItem.id));
+      }
+      return evalData;
+    },
+    [activeItem, block.id, rc, updateResponse]
+  );
+
+  // CRITICAL FIX: Auto-save & auto-grade 6-Step Interactive Reading whenever any step is answered
+  useEffect(() => {
+    if (mode !== 'interactive-reading' || !ir || !activeItem) return;
+    const anyAnswered =
+      Object.keys(clozeAnswers).length > 0 ||
+      Boolean(selectedGapSentence) ||
+      Boolean(highlighted1) ||
+      Boolean(highlighted2) ||
+      Boolean(selectedIdea) ||
+      Boolean(selectedTitle);
+
+    if (!anyAnswered) return;
+
+    const evalData = computeInteractiveReadingEvaluation(ir, activeItem, {
+      clozeAnswers,
+      selectedGapSentence,
+      highlighted1,
+      highlighted2,
+      selectedIdea,
+      selectedTitle,
+    });
+    updateResponse(block.id, evalData.patch);
+  }, [
+    mode,
+    ir,
+    activeItem,
+    clozeAnswers,
+    selectedGapSentence,
+    highlighted1,
+    highlighted2,
+    selectedIdea,
+    selectedTitle,
+    block.id,
+    updateResponse,
+  ]);
+
   const resetStates = () => {
     setStep(0);
     setClozeAnswers({});
@@ -267,157 +516,31 @@ export function InteractiveReadingBlock({
 
   const handleGradeInteractiveReading = () => {
     if (!ir || !activeItem) return;
-    let earned = 0;
-    const totalPossible = ir.blanks.length + 5;
-    const wrongDetails: string[] = [];
-    const rightDetails: string[] = [];
-
-    for (const b of ir.blanks) {
-      if (clozeAnswers[b.id] === b.correctAnswer) {
-        earned += 1;
-      } else {
-        wrongDetails.push(
-          `Blank [${b.id}]: chose "${clozeAnswers[b.id] || 'none'}" (Correct: "${b.correctAnswer}")`
-        );
-      }
-    }
-    if (earned === ir.blanks.length) {
-      rightDetails.push('Perfect lexical precision on Complete the Sentences.');
-    }
-
-    if (selectedGapSentence === ir.correctPassageGap) {
-      earned += 1;
-      rightDetails.push('Correctly bridged discourse transition in Complete the Passage.');
-    } else {
-      wrongDetails.push('Missed discourse transition sentence in Step 2 (Complete the Passage).');
-    }
-
-    if (highlighted1.trim() === ir.correctHighlight1.trim()) {
-      earned += 1;
-      rightDetails.push('Pinpointed exact factual evidence in Highlight the Answer #1.');
-    } else {
-      wrongDetails.push('Inaccurate sentence selection on Highlight the Answer #1.');
-    }
-
-    if (highlighted2.trim() === ir.correctHighlight2.trim()) {
-      earned += 1;
-      rightDetails.push('Pinpointed exact factual evidence in Highlight the Answer #2.');
-    } else {
-      wrongDetails.push('Inaccurate sentence selection on Highlight the Answer #2.');
-    }
-
-    if (selectedIdea === ir.correctMainIdea) {
-      earned += 1;
-      rightDetails.push('Identified primary macro-thesis of the passage.');
-    } else {
-      wrongDetails.push('Missed main idea synthesis in Identify the Idea.');
-    }
-
-    if (selectedTitle === ir.correctTitle) {
-      earned += 1;
-    } else {
-      wrongDetails.push('Selected suboptimal academic title.');
-    }
-
-    const accuracy = earned / Math.max(1, totalPossible);
-    const detScore = Math.round(70 + accuracy * 90);
+    const evalData = computeInteractiveReadingEvaluation(ir, activeItem, {
+      clozeAnswers,
+      selectedGapSentence,
+      highlighted1,
+      highlighted2,
+      selectedIdea,
+      selectedTitle,
+    });
     setSubmittedReading(true);
-
-    // Mark completed so it never repeats automatically!
     void markQuestionCompleted(activeItem.id);
     setCompletedIds((prev) => new Set(prev).add(activeItem.id));
-
-    const summaryTranscript = [
-      `[Interactive Reading — ${ir.sourceName}]`,
-      `Accuracy: ${earned}/${totalPossible} (${Math.round(accuracy * 100)}%) -> Estimated DET Band: ${detScore}/160`,
-      wrongDetails.length > 0
-        ? `Mistakes: ${wrongDetails.join(' | ')}`
-        : 'Zero errors across all 6 steps!',
-    ].join('\n');
-
-    updateResponse(block.id, {
-      questionId: activeItem.id,
-      questionType: 'interactive-reading',
-      promptSnapshot: activeItem.prompt,
-      textOrTranscript: summaryTranscript,
-      aiOverallScore: detScore,
-      aiSubscores: {
-        literacy: detScore,
-        comprehension: detScore,
-        conversation: Math.max(65, detScore - 5),
-        production: Math.max(65, detScore - 5),
-      },
-      aiFeedback: {
-        overallScore: detScore,
-        subscores: { literacy: detScore, comprehension: detScore },
-        criteria: {
-          reading_accuracy: `${earned} / ${totalPossible} items correct`,
-          source: ir.sourceName,
-        },
-        strengths:
-          rightDetails.length > 0 ? rightDetails : ['Completed interactive reading passage'],
-        weaknesses: wrongDetails,
-        suggestions: [
-          'Pay close attention to discourse markers (however, consequently, whereas) when bridging paragraphs.',
-        ],
-      },
-    });
+    updateResponse(block.id, evalData.patch);
   };
 
   const handleGradeReadAndComplete = () => {
     if (!rc || !activeItem) return;
-    let earned = 0;
-    const total = rc.blanks.length;
-    const missedWords: string[] = [];
-
-    for (const b of rc.blanks) {
-      const userSuffix = (prefixInputs[b.id] ?? '').trim().toLowerCase();
-      if (userSuffix === b.missingSuffix.toLowerCase()) {
-        earned += 1;
-      } else {
-        missedWords.push(`${b.prefix}[${b.missingSuffix}] (you typed: "${b.prefix}${userSuffix}")`);
-      }
-    }
-
-    const accuracy = earned / Math.max(1, total);
-    const detScore = Math.round(70 + accuracy * 90);
+    const evalData = syncReadAndCompleteToStore(prefixInputs, true);
     setSubmittedCloze(true);
-    setLastClozeScore({ earned, total, detScore });
-
-    // Mark completed in DB so next session automatically loads a new unseen passage!
-    void markQuestionCompleted(activeItem.id);
-    setCompletedIds((prev) => new Set(prev).add(activeItem.id));
-
-    const summaryTranscript = `[Read and Complete — ${rc.sourceName}] Score: ${earned}/${total} (${detScore}/160). ${
-      missedWords.length > 0
-        ? 'Missed: ' + missedWords.join(', ')
-        : 'All words completed accurately!'
-    }`;
-
-    updateResponse(block.id, {
-      questionId: activeItem.id,
-      questionType: 'read-and-complete',
-      promptSnapshot: activeItem.prompt,
-      textOrTranscript: summaryTranscript,
-      aiOverallScore: detScore,
-      aiSubscores: {
-        literacy: detScore,
-        comprehension: detScore,
-      },
-      aiFeedback: {
-        overallScore: detScore,
-        subscores: { literacy: detScore, comprehension: detScore },
-        criteria: { lexical_cloze: `${earned}/${total} correct` },
-        strengths:
-          earned >= total - 2
-            ? ['Strong orthographic & collocation recall']
-            : ['Completed C-test passage'],
-        weaknesses: missedWords,
-        suggestions: [
-          'Look at grammatical suffixes (-tion, -ive, -ly) and exact letter box counts.',
-        ],
-      },
-    });
+    if (evalData) {
+      setLastClozeScore({
+        earned: evalData.earned,
+        total: evalData.total,
+        detScore: evalData.detScore,
+      });
+    }
   };
 
   const renderParagraphWithDropdowns = () => {
@@ -617,7 +740,7 @@ export function InteractiveReadingBlock({
           </div>
 
           <p className="text-xs text-slate-500">
-            Each small box represents <strong>one missing letter</strong>. Typing a letter automatically moves to the next box (use Backspace to go back):
+            Each small box represents <strong>one missing letter</strong>. Your answers are <strong>auto-saved & auto-scored in real time</strong> for your final session evaluation:
           </p>
 
           <div className="text-base text-slate-800 leading-10 bg-slate-50 p-6 rounded-xl border border-slate-200">
@@ -634,9 +757,11 @@ export function InteractiveReadingBlock({
                   blank={blank}
                   value={prefixInputs[bId] ?? ''}
                   submitted={submittedCloze}
-                  onChange={(newVal) =>
-                    setPrefixInputs((prev) => ({ ...prev, [bId]: newVal }))
-                  }
+                  onChange={(newVal) => {
+                    const next = { ...prefixInputs, [bId]: newVal };
+                    setPrefixInputs(next);
+                    syncReadAndCompleteToStore(next, false);
+                  }}
                 />
               );
             })}

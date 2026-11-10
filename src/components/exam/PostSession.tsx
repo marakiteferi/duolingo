@@ -1,266 +1,404 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useAppStore } from '../../stores/appStore';
-import { db } from '../../db/database';
+import { db, DEFAULT_SPEAKING_PROMPT } from '../../db/database';
 import { evaluateResponse } from '../../services/gemini';
 import { formatTime } from '../../utils/helpers';
-import type { BlockResponse, DETSkill } from '../../types';
+import type { AIFeedback, DETSkill } from '../../types';
 
 export function PostSession() {
   const activeRun = useSessionStore((s) => s.activeRun);
+  const draftResponses = useSessionStore((s) => s.draftResponses);
+  const updateResponse = useSessionStore((s) => s.updateResponse);
   const clearActiveRun = useSessionStore((s) => s.clearActiveRun);
   const setView = useAppStore((s) => s.setView);
-  const setConfigSection = useAppStore((s) => s.setConfigSection);
 
   const [evaluating, setEvaluating] = useState(false);
+  const [evalProgress, setEvalProgress] = useState<string>('');
   const [evalError, setEvalError] = useState<string | null>(null);
-  const [queuedOffline, setQueuedOffline] = useState(false);
-  const [localResponses, setLocalResponses] = useState<Record<string, BlockResponse>>(
-    activeRun?.responses ?? {}
-  );
 
-  const handleUpdateText = (blockId: string, text: string) => {
-    setLocalResponses((prev) => ({
-      ...prev,
-      [blockId]: { ...prev[blockId], textOrTranscript: text, timestampedTranscript: text },
-    }));
-  };
-
-  const handleEvaluate = useCallback(async () => {
+  const evaluateAllBlocks = useCallback(async () => {
     if (!activeRun) return;
-    if (!navigator.onLine) {
-      setQueuedOffline(true);
-      setEvalError('You are currently offline. Responses are saved and will auto-evaluate when back online.');
-      return;
-    }
     setEvaluating(true);
     setEvalError(null);
+
     try {
       const settings = await db.settings.get('app-settings');
-      if (!settings?.geminiApiKey) {
-        setEvalError('Gemini API key not set. Go to Config -> Settings to paste your free Google AI Studio key.');
-        setEvaluating(false);
-        return;
-      }
       const evalPrompts = await db.evalPrompts.toArray();
-      const updatedResponses = { ...localResponses };
-      const blockScores: number[] = [];
-      const skillScores: Partial<Record<DETSkill, number[]>> = {};
+      const apiKey = settings?.geminiApiKey ?? '';
 
-      for (const block of activeRun.blockConfigs) {
-        const response = updatedResponses[block.id];
-        const text = response?.textOrTranscript?.trim() ?? '';
-        if (!text) continue;
-        const evalPrompt =
-          evalPrompts.find((ep) => ep.id === block.evalPromptId) ??
-          evalPrompts.find((ep) => ep.appliesToType === block.type) ??
-          evalPrompts[0];
-        if (!evalPrompt) continue;
+      for (let i = 0; i < activeRun.blockConfigs.length; i++) {
+        const block = activeRun.blockConfigs[i];
+        const resp = draftResponses[block.id] ?? activeRun.responses[block.id];
 
-        const verifiedDuration =
-          response?.audioDurationSec ??
-          (response?.timeSpentSec && response.timeSpentSec > 0 ? response.timeSpentSec : block.durationSec);
+        if (resp?.aiOverallScore !== undefined && resp?.aiFeedback) {
+          continue;
+        }
+
+        const studentText = (resp?.timestampedTranscript || resp?.textOrTranscript || '').trim();
+
+        if (!studentText) {
+          const skippedFeedback: AIFeedback = {
+            overallScore: 0,
+            subscores: { literacy: 0, comprehension: 0, conversation: 0, production: 0 },
+            criteria: {
+              status: 'Block was skipped or left unanswered (counted as 0/160 toward session total).',
+            },
+            strengths: [],
+            weaknesses: ['Block was skipped or left blank during the session.'],
+            suggestions: ['Complete all blocks in the session to maximize your overall DET score.'],
+          };
+          updateResponse(block.id, {
+            aiOverallScore: 0,
+            aiSubscores: skippedFeedback.subscores,
+            aiFeedback: skippedFeedback,
+          });
+          continue;
+        }
+
+        setEvalProgress(`Evaluating Block ${i + 1} of ${activeRun.blockConfigs.length}: ${block.name}...`);
+
+        const isSpokenResponse =
+          block.type === 'speaking' ||
+          block.type === 'shadowing' ||
+          resp?.questionType === 'spoken-collocation-drill' ||
+          Boolean(resp?.audioBlobRef);
+
+        const evalPrompt = isSpokenResponse
+          ? evalPrompts.find((ep) => ep.appliesToType === 'speaking')
+          : evalPrompts.find((ep) => ep.id === block.evalPromptId) ??
+            evalPrompts.find((ep) => ep.appliesToType === block.type) ??
+            evalPrompts[0];
+
+        const verifiedDuration = resp?.audioDurationSec || resp?.timeSpentSec || 60;
 
         const feedback = await evaluateResponse({
-          apiKey: settings.geminiApiKey,
-          evalPromptTemplate: evalPrompt.promptText,
+          apiKey,
+          evalPromptTemplate:
+            evalPrompt?.promptText ??
+            (isSpokenResponse ? DEFAULT_SPEAKING_PROMPT : ''),
           variables: {
-            prompt: response?.promptSnapshot || block.instructions,
-            response: text,
-            transcript: response?.timestampedTranscript || text,
+            prompt: resp?.promptSnapshot || block.instructions,
+            response: studentText,
+            transcript: studentText,
             durationSec: String(verifiedDuration),
-            wpm: String(response?.wpm ?? 130),
-            fillerCount: String(response?.fillerCount ?? 0),
+            wpm: String(resp?.wpm ?? 0),
+            fillerCount: String(resp?.fillerCount ?? 0),
           },
         });
 
-        const subVals = Object.values(feedback.subscores);
-        const computedScore =
-          feedback.overallScore ??
-          (subVals.length > 0
-            ? Math.round(subVals.reduce((a, b) => a + b, 0) / subVals.length)
-            : 125);
-        blockScores.push(computedScore);
-
-        const targetSkill: DETSkill =
-          block.type === 'speaking' || block.type === 'shadowing'
-            ? 'speaking'
-            : block.type === 'dictogloss'
-            ? 'listening'
-            : block.type === 'mock-test'
-            ? 'reading'
-            : 'writing';
-        skillScores[targetSkill] = [...(skillScores[targetSkill] ?? []), computedScore];
-
-        updatedResponses[block.id] = {
-          ...response,
+        updateResponse(block.id, {
           aiFeedback: feedback,
-          aiOverallScore: computedScore,
+          aiOverallScore: feedback.overallScore ?? 0,
           aiSubscores: feedback.subscores,
-          evalPendingOffline: false,
-        };
+        });
       }
 
-      const compositeOverall =
-        blockScores.length > 0
-          ? Math.round(blockScores.reduce((a, b) => a + b, 0) / blockScores.length)
-          : undefined;
-      const perSkillScores: Partial<Record<DETSkill, number>> = {};
-      for (const [sk, arr] of Object.entries(skillScores) as [DETSkill, number[]][]) {
-        if (arr && arr.length > 0) {
-          perSkillScores[sk] = Math.round(arr.reduce((a, b) => a + b, 0) / arr.length);
-        }
+      const latestResponses = useSessionStore.getState().draftResponses;
+      const totalBlocksCount = Math.max(1, activeRun.blockConfigs.length);
+      let totalScoreSum = 0;
+
+      for (const b of activeRun.blockConfigs) {
+        const r = latestResponses[b.id];
+        totalScoreSum += r?.aiOverallScore ?? 0;
       }
 
-      setLocalResponses(updatedResponses);
+      const penalizedOverallScore = Math.round(totalScoreSum / totalBlocksCount);
       await db.sessionRuns.update(activeRun.id, {
-        responses: updatedResponses,
+        responses: latestResponses,
         summary: {
-          overallScore: compositeOverall,
-          perSkillScores,
+          overallScore: penalizedOverallScore,
           durationSec: activeRun.overallElapsedSec,
         },
       });
-      setQueuedOffline(false);
     } catch (err) {
-      setEvalError(err instanceof Error ? err.message : 'Evaluation failed.');
+      setEvalError(err instanceof Error ? err.message : 'Evaluation encountered an error.');
     } finally {
       setEvaluating(false);
+      setEvalProgress('');
     }
-  }, [activeRun, localResponses]);
+  }, [activeRun, draftResponses, updateResponse]);
 
   useEffect(() => {
-    if (!queuedOffline) return;
-    const onOnline = () => void handleEvaluate();
-    window.addEventListener('online', onOnline);
-    return () => window.removeEventListener('online', onOnline);
-  }, [queuedOffline, handleEvaluate]);
+    void evaluateAllBlocks();
+  }, [evaluateAllBlocks]);
 
   if (!activeRun) return null;
 
-  const scoredValues = Object.values(localResponses)
-    .map((r) => r.aiOverallScore)
-    .filter((v): v is number => typeof v === 'number');
-  const sessionAverage =
-    scoredValues.length > 0
-      ? Math.round(scoredValues.reduce((a, b) => a + b, 0) / scoredValues.length)
-      : null;
+  const blocks = activeRun.blockConfigs;
+  const totalBlocks = Math.max(1, blocks.length);
+
+  let sumAllBlocks = 0;
+  let answeredBlocksCount = 0;
+  let sumAnsweredOnly = 0;
+
+  const subscoreTotals: Record<string, { sum: number; count: number }> = {
+    literacy: { sum: 0, count: 0 },
+    comprehension: { sum: 0, count: 0 },
+    conversation: { sum: 0, count: 0 },
+    production: { sum: 0, count: 0 },
+  };
+
+  for (const b of blocks) {
+    const r = draftResponses[b.id] ?? activeRun.responses[b.id];
+    const hasContent = Boolean(
+      r?.textOrTranscript?.trim() || r?.audioBlobRef || (r?.aiOverallScore && r.aiOverallScore > 0)
+    );
+    const blockScore = hasContent ? (r?.aiOverallScore ?? 0) : 0;
+
+    sumAllBlocks += blockScore;
+    if (hasContent && blockScore > 0) {
+      answeredBlocksCount += 1;
+      sumAnsweredOnly += blockScore;
+    }
+
+    for (const key of ['literacy', 'comprehension', 'conversation', 'production'] as DETSkill[] | string[]) {
+      const subVal = hasContent ? (r?.aiSubscores?.[key] ?? blockScore) : 0;
+      if (subscoreTotals[key]) {
+        subscoreTotals[key].sum += subVal;
+        subscoreTotals[key].count += 1;
+      }
+    }
+  }
+
+  const strictOverallScore = Math.round(sumAllBlocks / totalBlocks);
+  const answeredOnlyAverage =
+    answeredBlocksCount > 0 ? Math.round(sumAnsweredOnly / answeredBlocksCount) : 0;
+  const skippedCount = totalBlocks - answeredBlocksCount;
 
   return (
-    <div className="max-w-3xl mx-auto px-6 py-8">
-      <div className="bg-white border border-slate-200 rounded-2xl p-6 mb-8 flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <span className="text-xs font-bold uppercase tracking-wider text-primary-600">
-            Session Complete
-          </span>
-          <h2 className="text-2xl font-bold text-slate-900 mt-0.5">{activeRun.templateName}</h2>
-          <p className="text-xs text-slate-500 mt-1">
-            Total Time: {formatTime(activeRun.overallElapsedSec)} • {activeRun.blockConfigs.length} Blocks
-          </p>
-        </div>
-        {sessionAverage !== null ? (
-          <div className="text-right bg-primary-50 border border-primary-200 px-5 py-3 rounded-xl">
-            <span className="text-xs font-semibold text-primary-700 block">Estimated DET Band</span>
-            <span className="text-4xl font-black text-primary-600">{sessionAverage}</span>
-            <span className="text-xs text-primary-600"> / 160</span>
+    <div className="max-w-4xl mx-auto px-6 py-8 space-y-6">
+      <div className="bg-slate-900 text-white rounded-2xl p-6 shadow-md space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <span className="text-xs font-bold uppercase tracking-wider text-primary-400">
+              Session Complete • {activeRun.templateName}
+            </span>
+            <h2 className="text-2xl font-bold mt-1">
+              Official-Style DET Performance Breakdown
+            </h2>
+            <p className="text-xs text-slate-300 mt-0.5">
+              Total Time: {formatTime(activeRun.overallElapsedSec)} • Blocks Completed:{' '}
+              {answeredBlocksCount} of {totalBlocks}
+              {skippedCount > 0
+                ? ` (${skippedCount} skipped block${skippedCount > 1 ? 's' : ''} counted as 0)`
+                : ' (All blocks completed ✓)'}
+            </p>
           </div>
-        ) : (
-          <button
-            onClick={handleEvaluate}
-            disabled={evaluating}
-            className="px-6 py-3 bg-primary-600 text-white text-sm font-bold rounded-xl hover:bg-primary-700 disabled:opacity-50 cursor-pointer"
-          >
-            {evaluating ? 'Grading with Gemini...' : 'Grade All Blocks with Gemini AI'}
-          </button>
-        )}
+
+          <div className="flex items-center gap-4">
+            <div className="text-right bg-slate-800 border border-slate-700 px-4 py-2.5 rounded-xl">
+              <p className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold">
+                True Session Score (All {totalBlocks} Blocks)
+              </p>
+              <p className="text-3xl font-extrabold text-primary-400 font-mono">
+                {strictOverallScore} <span className="text-sm text-slate-400">/ 160</span>
+              </p>
+              {skippedCount > 0 && answeredOnlyAverage > 0 && (
+                <p className="text-[11px] text-amber-300 mt-0.5">
+                  Answered-Only Avg: {answeredOnlyAverage}/160 (-{answeredOnlyAverage - strictOverallScore} penalty for {skippedCount} skipped)
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2">
+          {(['literacy', 'comprehension', 'conversation', 'production'] as const).map((sub) => {
+            const stat = subscoreTotals[sub];
+            const val = stat.count > 0 ? Math.round(stat.sum / stat.count) : 0;
+            return (
+              <div
+                key={sub}
+                className="bg-slate-800/90 border border-slate-700 rounded-xl p-3"
+              >
+                <p className="text-xs uppercase tracking-wider text-slate-400 font-bold">
+                  {sub}
+                </p>
+                <p className="text-xl font-bold text-white font-mono mt-0.5">
+                  {val} <span className="text-xs text-slate-400">/ 160</span>
+                </p>
+              </div>
+            );
+          })}
+        </div>
       </div>
 
-      {evalError && (
-        <div className="mb-6 text-sm text-red-700 bg-red-50 border border-red-200 rounded-xl p-4">
-          {evalError}
+      {evaluating && (
+        <div className="bg-accent-50 border border-accent-200 rounded-xl p-5 flex items-center justify-center gap-3 text-sm font-semibold text-accent-900">
+          <div className="w-5 h-5 border-2 border-accent-600 border-t-transparent rounded-full animate-spin" />
+          <span>{evalProgress || 'Evaluating session blocks...'}</span>
         </div>
       )}
 
-      <div className="space-y-6">
-        {activeRun.blockConfigs.map((block, idx) => {
-          const response = localResponses[block.id];
-          const feedback = response?.aiFeedback;
-          const score = response?.aiOverallScore;
-          const verifiedSec = response?.audioDurationSec ?? response?.timeSpentSec ?? 0;
+      {evalError && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-xs text-red-700 flex items-center justify-between">
+          <span>{evalError}</span>
+          <button
+            type="button"
+            onClick={() => void evaluateAllBlocks()}
+            className="px-3 py-1 bg-red-600 text-white font-bold rounded-lg cursor-pointer"
+          >
+            Retry Evaluation
+          </button>
+        </div>
+      )}
+
+      <div className="space-y-4">
+        <h3 className="text-base font-bold text-slate-900">
+          Block-by-Block Evaluation ({blocks.length} Blocks)
+        </h3>
+
+        {blocks.map((block, idx) => {
+          const resp = draftResponses[block.id] ?? activeRun.responses[block.id];
+          const fb = resp?.aiFeedback;
+          const hasContent = Boolean(
+            resp?.textOrTranscript?.trim() ||
+              resp?.audioBlobRef ||
+              (resp?.aiOverallScore && resp.aiOverallScore > 0)
+          );
+          const score = hasContent ? (resp?.aiOverallScore ?? 0) : 0;
+
           return (
-            <div key={block.id} className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-              <div className="flex items-center justify-between p-4 bg-slate-50 border-b border-slate-100">
-                <div>
-                  <h3 className="font-semibold text-slate-900">
-                    {idx + 1}. {block.name}
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    {block.type} • Verified Duration: {verifiedSec}s
-                    {response?.wpm ? ` • ${response.wpm} WPM` : ''}
-                    {response?.fillerCount !== undefined ? ` • ${response.fillerCount} fillers` : ''}
-                    {response?.attemptCount && response.attemptCount > 1 ? ` • ${response.attemptCount} attempts` : ''}
-                  </p>
-                </div>
-                {score !== undefined && (
-                  <div className="text-right">
-                    <span className="text-2xl font-black text-primary-600">{score}</span>
-                    <span className="text-xs text-slate-400 block">/ 160</span>
+            <div
+              key={block.id}
+              className={`bg-white rounded-2xl border-2 p-5 space-y-4 shadow-2xs ${
+                !hasContent ? 'border-amber-200 bg-amber-50/20' : 'border-slate-200'
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-6 h-6 rounded-full bg-slate-900 text-white text-xs font-bold flex items-center justify-center">
+                    {idx + 1}
+                  </span>
+                  <div>
+                    <h4 className="font-bold text-slate-900 text-sm">{block.name}</h4>
+                    <span className="text-xs text-slate-500">
+                      Mode: {resp?.questionType || block.type} • Time Spent:{' '}
+                      {formatTime(resp?.timeSpentSec ?? 0)}
+                    </span>
                   </div>
-                )}
-              </div>
-              <div className="p-5 space-y-4">
-                {response?.audioBlobRef && (
-                  <audio controls src={response.audioBlobRef} className="w-full h-10" />
-                )}
-                <div>
-                  <label className="block text-xs font-medium text-slate-500 mb-1">
-                    Response / Timestamped Verbatim Transcript:
-                  </label>
-                  <textarea
-                    value={response?.timestampedTranscript || response?.textOrTranscript || ''}
-                    onChange={(e) => handleUpdateText(block.id, e.target.value)}
-                    rows={4}
-                    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs font-mono text-slate-800"
-                  />
                 </div>
-                {feedback?.suggestedFix && (
-                  <div className="bg-primary-50 border border-primary-200 rounded-xl p-3.5 text-xs">
-                    <p className="font-bold text-primary-800 mb-1">145–155 Band Suggested Upgrade:</p>
-                    <p className="text-slate-800">{feedback.suggestedFix}</p>
-                  </div>
-                )}
+
+                <span
+                  className={`px-3 py-1 rounded-full text-xs font-extrabold font-mono ${
+                    !hasContent || score === 0
+                      ? 'bg-red-100 text-red-800 border border-red-300'
+                      : score >= 135
+                      ? 'bg-green-100 text-green-800 border border-green-300'
+                      : 'bg-primary-100 text-primary-800 border border-primary-300'
+                  }`}
+                >
+                  {!hasContent ? '0 / 160 (Skipped)' : `${score} / 160`}
+                </span>
               </div>
+
+              {resp?.promptSnapshot && (
+                <div className="text-xs bg-slate-50 p-3 rounded-lg border border-slate-200 text-slate-700 whitespace-pre-wrap">
+                  <strong className="text-slate-900">Task Prompt:</strong> {resp.promptSnapshot}
+                </div>
+              )}
+
+              {resp?.audioBlobRef && (
+                <div>
+                  <p className="text-xs font-semibold text-slate-600 mb-1">Your Recorded Audio:</p>
+                  <audio controls src={resp.audioBlobRef} className="w-full h-9" />
+                </div>
+              )}
+
+              {resp?.textOrTranscript && (
+                <div className="text-xs bg-slate-50 p-3.5 rounded-xl border border-slate-200 text-slate-800 whitespace-pre-wrap leading-relaxed">
+                  <strong className="block text-slate-600 mb-1">
+                    Submitted Response / Transcript:
+                  </strong>
+                  {resp.textOrTranscript}
+                </div>
+              )}
+
+              {fb && (
+                <div className="space-y-3 pt-1">
+                  {fb.note && (
+                    <p className="text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-3 py-1.5 rounded-lg">
+                      ℹ️ {fb.note}
+                    </p>
+                  )}
+
+                  {Object.keys(fb.criteria ?? {}).length > 0 && (
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+                      {Object.entries(fb.criteria).map(([k, v]) => (
+                        <div
+                          key={k}
+                          className="bg-slate-50 p-2.5 rounded-lg border border-slate-200 text-xs"
+                        >
+                          <strong className="uppercase text-[10px] text-slate-500 block">
+                            {k.replace(/_/g, ' ')}
+                          </strong>
+                          <span className="text-slate-800">{v}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                    {fb.strengths.length > 0 && (
+                      <div className="bg-green-50 border border-green-200 rounded-xl p-3">
+                        <strong className="text-green-900 block mb-1">✓ Strengths</strong>
+                        <ul className="list-disc list-inside space-y-1 text-green-800">
+                          {fb.strengths.map((s, i) => (
+                            <li key={i}>{s}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {fb.weaknesses.length > 0 && (
+                      <div className="bg-red-50 border border-red-200 rounded-xl p-3">
+                        <strong className="text-red-900 block mb-1">⚠️ Areas to Fix</strong>
+                        <ul className="list-disc list-inside space-y-1 text-red-800">
+                          {fb.weaknesses.map((w, i) => (
+                            <li key={i}>{w}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+
+                  {fb.suggestedFix && (
+                    <div className="bg-primary-50 border border-primary-200 rounded-xl p-3.5 text-xs text-slate-900">
+                      <strong className="text-primary-800 block mb-1">
+                        ✨ 150-Band C1/C2 Model Rewrite:
+                      </strong>
+                      <p className="italic leading-relaxed">{fb.suggestedFix}</p>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           );
         })}
       </div>
 
-      <div className="mt-8 flex flex-wrap justify-between items-center gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-4 pt-4 border-t border-slate-200">
         <button
-          onClick={handleEvaluate}
-          disabled={evaluating}
-          className="px-4 py-2 text-sm font-semibold text-primary-700 bg-primary-50 border border-primary-200 rounded-lg"
+          type="button"
+          onClick={() => {
+            clearActiveRun();
+            setView('config');
+          }}
+          className="px-5 py-3 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold rounded-xl cursor-pointer"
         >
-          {evaluating ? 'Re-evaluating...' : 'Re-evaluate Responses with AI'}
+          ← Return to 21-Day Dashboard
         </button>
-        <div className="flex gap-3">
-          <button
-            onClick={() => clearActiveRun()}
-            className="px-4 py-2.5 text-sm font-semibold text-slate-700 border border-slate-300 rounded-lg"
-          >
-            Start Another Session
-          </button>
-          <button
-            onClick={() => {
-              clearActiveRun();
-              setConfigSection('history');
-              setView('config');
-            }}
-            className="px-5 py-2.5 bg-slate-900 text-white text-sm font-semibold rounded-lg"
-          >
-            View Score Trends & Error Log
-          </button>
-        </div>
+
+        <button
+          type="button"
+          onClick={() => {
+            clearActiveRun();
+            setView('exam');
+          }}
+          className="px-6 py-3 bg-primary-600 hover:bg-primary-700 text-white text-sm font-bold rounded-xl cursor-pointer shadow-xs"
+        >
+          🎯 Back to Daily Sessions Hub →
+        </button>
       </div>
     </div>
   );
