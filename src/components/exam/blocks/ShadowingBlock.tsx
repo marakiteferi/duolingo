@@ -37,10 +37,12 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [speechRate, setSpeechRate] = useState<number>(1.0);
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+  const [hideTranscript, setHideTranscript] = useState(false);
   const [recordingState, setRecordingState] = useState<'idle' | 'recording' | 'transcribing' | 'done'>('idle');
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
+  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const recorderRef = useRef<AudioRecorderService | null>(null);
   const recTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordDurationRef = useRef<number>(0);
@@ -50,8 +52,14 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
   useEffect(() => {
     db.questionBank.toArray().then((all) => {
       const shadowItems = all.filter(
-        (q) => q.tags.includes('shadowing') || q.type === 'read-aloud' || q.sourceAudioText
+        (q) =>
+          Boolean(q.audioUrl) ||
+          q.tags.includes('shadowing') ||
+          q.type === 'read-aloud' ||
+          Boolean(q.sourceAudioText)
       );
+      // Prioritize items with real human audio first
+      shadowItems.sort((a, b) => (b.audioUrl ? 1 : 0) - (a.audioUrl ? 1 : 0));
       setPassages(shadowItems.length > 0 ? shadowItems : all);
     });
     return () => {
@@ -62,32 +70,58 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
     };
   }, []);
 
+  const currentItem = passages[selectedIdx];
+  const humanAudioUrl = currentItem?.audioUrl?.trim() || '';
   const sourceText =
-    passages[selectedIdx]?.sourceAudioText ||
-    passages[selectedIdx]?.prompt ||
+    currentItem?.sourceAudioText ||
+    currentItem?.prompt ||
     'While automated static analysis accelerates vulnerability discovery across large codebases, human security critics remain indispensable for verifying complex business logic and preventing subtle authentication bypasses.';
 
+  // Sync playbackRate and pitch preservation on the HTML5 <audio> element
+  useEffect(() => {
+    const el = audioPlayerRef.current;
+    if (!el) return;
+    el.playbackRate = speechRate;
+    if ('preservesPitch' in el) {
+      (el as HTMLAudioElement & { preservesPitch?: boolean }).preservesPitch = true;
+    }
+  }, [speechRate, humanAudioUrl]);
+
   const playNativeAudio = useCallback(() => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      setError('Browser SpeechSynthesis is not supported in this environment.');
+    if (humanAudioUrl && audioPlayerRef.current) {
+      audioPlayerRef.current.playbackRate = speechRate;
+      audioPlayerRef.current.currentTime = 0;
+      void audioPlayerRef.current.play();
+      setIsPlayingAudio(true);
       return;
     }
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(sourceText);
-    utterance.lang = 'en-US';
-    utterance.rate = speechRate;
-    utterance.onstart = () => setIsPlayingAudio(true);
-    utterance.onend = () => setIsPlayingAudio(false);
-    utterance.onerror = () => setIsPlayingAudio(false);
-    window.speechSynthesis.speak(utterance);
-  }, [sourceText, speechRate]);
-
-  const stopNativeAudio = useCallback(() => {
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();
-      setIsPlayingAudio(false);
+      const utterance = new SpeechSynthesisUtterance(sourceText);
+      utterance.lang = 'en-US';
+      utterance.rate = speechRate;
+      utterance.onstart = () => setIsPlayingAudio(true);
+      utterance.onend = () => setIsPlayingAudio(false);
+      utterance.onerror = () => setIsPlayingAudio(false);
+      window.speechSynthesis.speak(utterance);
     }
+  }, [humanAudioUrl, sourceText, speechRate]);
+
+  const stopNativeAudio = useCallback(() => {
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.pause();
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    setIsPlayingAudio(false);
   }, []);
+
+  const rewindFiveSeconds = () => {
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.currentTime = Math.max(0, audioPlayerRef.current.currentTime - 5);
+    }
+  };
 
   const handleStartShadowing = useCallback(async () => {
     setError(null);
@@ -95,7 +129,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
       const recorder = new AudioRecorderService();
       const hasPermission = await recorder.requestPermission();
       if (!hasPermission) {
-        setError('Microphone permission denied.');
+        setError('Microphone permission denied. Use headphones so your mic only captures your voice.');
         return;
       }
       await recorder.start();
@@ -156,15 +190,29 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <WhisperLiveIndicator />
         <div className="flex items-center gap-2">
-          <label className="text-xs font-semibold text-slate-600">Native Speed:</label>
-          {[0.9, 1.0, 1.1].map((rate) => (
+          <WhisperLiveIndicator />
+          <span
+            className={`text-xs font-bold px-2.5 py-1 rounded-full ${
+              humanAudioUrl
+                ? 'bg-green-100 text-green-800 border border-green-300'
+                : 'bg-amber-100 text-amber-800'
+            }`}
+          >
+            {humanAudioUrl
+              ? '🎙️ Real Human Audio Active'
+              : '⚠️ Synthetic TTS Fallback (Add Human MP3 in Config -> Question Bank)'}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <label className="text-xs font-semibold text-slate-600">Speed:</label>
+          {[0.85, 0.95, 1.0, 1.1].map((rate) => (
             <button
               key={rate}
               type="button"
               onClick={() => setSpeechRate(rate)}
-              className={`px-2.5 py-1 text-xs rounded-lg font-mono font-semibold border ${
+              className={`px-2 py-1 text-xs rounded-lg font-mono font-semibold border cursor-pointer ${
                 speechRate === rate
                   ? 'bg-primary-600 text-white border-primary-600'
                   : 'bg-white text-slate-700 border-slate-200'
@@ -176,29 +224,74 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
           {passages.length > 1 && (
             <button
               type="button"
-              onClick={() => setSelectedIdx((i) => (i + 1) % passages.length)}
-              className="text-xs font-semibold text-primary-700 bg-primary-50 border border-primary-200 px-3 py-1 rounded-lg"
+              onClick={() => {
+                stopNativeAudio();
+                setSelectedIdx((i) => (i + 1) % passages.length);
+              }}
+              className="text-xs font-semibold text-primary-700 bg-primary-50 border border-primary-200 px-3 py-1 rounded-lg cursor-pointer"
             >
-              Switch Passage ({selectedIdx + 1}/{passages.length})
+              Next Clip ({selectedIdx + 1}/{passages.length})
             </button>
           )}
         </div>
       </div>
 
+      {/* Real Human HTML5 Audio Player Bar */}
+      {humanAudioUrl && (
+        <div className="bg-slate-900 text-white rounded-xl p-4 space-y-2">
+          <div className="flex items-center justify-between text-xs text-slate-300">
+            <span>Human Reference Track (Pitch-Preserved {speechRate}x) — Wear headphones while shadowing</span>
+            <button
+              type="button"
+              onClick={rewindFiveSeconds}
+              className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-white rounded font-mono text-xs cursor-pointer"
+            >
+              ↺ Rewind -5s
+            </button>
+          </div>
+          <audio
+            ref={audioPlayerRef}
+            controls
+            src={humanAudioUrl}
+            onPlay={() => setIsPlayingAudio(true)}
+            onPause={() => setIsPlayingAudio(false)}
+            onEnded={() => setIsPlayingAudio(false)}
+            className="w-full h-10"
+          />
+        </div>
+      )}
+
       <div className="bg-primary-50 border border-primary-200 rounded-xl p-5 space-y-2">
         <div className="flex items-center justify-between">
           <span className="text-xs font-bold uppercase tracking-wider text-primary-700">
-            Arguelles Shadowing Passage (Lag by ~0.5s, mirror rhythm & stress)
+            Arguelles Shadowing Script (Lag by ~0.5s, mirror human prosody & stress)
           </span>
-          <button
-            type="button"
-            onClick={isPlayingAudio ? stopNativeAudio : playNativeAudio}
-            className="text-xs font-semibold px-3 py-1 rounded-lg bg-white border border-primary-300 text-primary-800 hover:bg-primary-100"
-          >
-            {isPlayingAudio ? 'Stop Audio Preview' : 'Listen First (Preview)'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setHideTranscript((h) => !h)}
+              className="text-xs font-semibold px-2.5 py-1 rounded-lg bg-white border border-slate-300 text-slate-700 cursor-pointer"
+            >
+              {hideTranscript ? 'Show Transcript' : 'Blind Shadowing (Hide Text)'}
+            </button>
+            {!humanAudioUrl && (
+              <button
+                type="button"
+                onClick={isPlayingAudio ? stopNativeAudio : playNativeAudio}
+                className="text-xs font-semibold px-3 py-1 rounded-lg bg-white border border-primary-300 text-primary-800"
+              >
+                {isPlayingAudio ? 'Stop Audio' : 'Preview Audio'}
+              </button>
+            )}
+          </div>
         </div>
-        <p className="text-base text-slate-900 leading-relaxed font-medium">{sourceText}</p>
+        {hideTranscript ? (
+          <p className="text-sm italic text-slate-500 py-4 text-center">
+            Transcript hidden for pure auditory-motor shadowing. Listen closely to the human speaker's intonation!
+          </p>
+        ) : (
+          <p className="text-base text-slate-900 leading-relaxed font-medium">{sourceText}</p>
+        )}
       </div>
 
       <div className="flex justify-center">
@@ -209,7 +302,7 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
             className="px-7 py-4 rounded-2xl bg-red-600 hover:bg-red-700 text-white font-bold text-sm shadow-lg cursor-pointer flex items-center gap-3"
           >
             <span className="w-3 h-3 rounded-full bg-white animate-ping" />
-            Play Native Audio & Record Shadowing Simultaneously
+            Play Human Audio & Record Your Shadowing Simultaneously
           </button>
         )}
         {recordingState === 'recording' && (
@@ -241,10 +334,19 @@ export function ShadowingBlock({ block }: { block: BlockConfig }) {
               <p className="text-lg font-bold text-slate-800">{response.wpm ?? 0} WPM</p>
             </div>
             <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
-              <p className="text-xs text-slate-500">Audio Duration</p>
-              <p className="text-lg font-bold text-slate-800">{response.audioDurationSec ?? recordingSeconds}s</p>
+              <p className="text-xs text-slate-500">Spoken Duration</p>
+              <p className="text-lg font-bold text-slate-800">
+                {response.audioDurationSec ?? recordingSeconds}s
+              </p>
             </div>
           </div>
+
+          {response.audioBlobRef && (
+            <div>
+              <p className="text-xs font-semibold text-slate-600 mb-1">Your Recorded Shadowing:</p>
+              <audio controls src={response.audioBlobRef} className="w-full h-9" />
+            </div>
+          )}
 
           {response.timestampedTranscript && (
             <div>

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSessionStore } from '../../../stores/sessionStore';
 import { db } from '../../../db/database';
 import type { BlockConfig, QuestionBankItem } from '../../../types';
@@ -9,9 +9,12 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
   const communicativePressure = useSessionStore((s) => s.activeRun?.communicativePressure);
 
   const [passages, setPassages] = useState<QuestionBankItem[]>([]);
+  const [selectedIdx, setSelectedIdx] = useState(0);
   const [phase, setPhase] = useState<'listen' | 'reconstruct'>('listen');
   const [playCount, setPlayCount] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const response = draftResponses[block.id];
   const fragmentNotes = response?.fragmentNotes ?? '';
@@ -19,7 +22,10 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
 
   useEffect(() => {
     db.questionBank.toArray().then((all) => {
-      const items = all.filter((q) => q.tags.includes('dictogloss') || q.skill === 'listening');
+      const items = all.filter(
+        (q) => Boolean(q.audioUrl) || q.tags.includes('dictogloss') || q.skill === 'listening'
+      );
+      items.sort((a, b) => (b.audioUrl ? 1 : 0) - (a.audioUrl ? 1 : 0));
       setPassages(items.length > 0 ? items : all);
     });
     return () => {
@@ -29,12 +35,20 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
     };
   }, []);
 
+  const currentItem = passages[selectedIdx];
+  const humanAudioUrl = currentItem?.audioUrl?.trim() || '';
   const sourcePassage =
-    passages[0]?.sourceAudioText ||
-    passages[0]?.prompt ||
+    currentItem?.sourceAudioText ||
+    currentItem?.prompt ||
     'Second-language acquisition research demonstrates that transitioning from intermediate comprehension to advanced production requires retrieving multi-word formulaic sequences under communicative time pressure rather than assembling isolated vocabulary through conscious grammar rules.';
 
   const handlePlayPassage = useCallback(() => {
+    if (humanAudioUrl && audioRef.current) {
+      audioRef.current.currentTime = 0;
+      void audioRef.current.play();
+      setIsPlaying(true);
+      return;
+    }
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(sourcePassage);
@@ -46,11 +60,10 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
       setPlayCount((c) => c + 1);
     };
     window.speechSynthesis.speak(utterance);
-  }, [sourcePassage]);
+  }, [humanAudioUrl, sourcePassage]);
 
   const handleNotesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value;
-    // Limit fragment notes to ~25 words so user compresses into symbols/keywords
     const words = val.trim().split(/\s+/).filter(Boolean);
     if (words.length > 25) return;
     updateResponse(block.id, {
@@ -69,21 +82,32 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
 
   return (
     <div className="space-y-5">
-      {/* Phase Toggle Header */}
       <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <span className="text-xs font-bold uppercase tracking-wider text-accent-700">
-            Dictogloss Working-Memory Protocol
+            Dictogloss Working-Memory Protocol {humanAudioUrl ? '(🎙️ Real Human Audio)' : '(TTS Fallback)'}
           </span>
           <p className="text-xs text-slate-500 mt-0.5">
             Phase 1: Listen & take compressed 2-4 word fragment notes. Phase 2: Reconstruct full meaning from memory.
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2">
+          {passages.length > 1 && (
+            <button
+              type="button"
+              onClick={() => {
+                setPlayCount(0);
+                setSelectedIdx((i) => (i + 1) % passages.length);
+              }}
+              className="px-2.5 py-1.5 text-xs font-semibold text-slate-600 border border-slate-200 rounded-lg cursor-pointer"
+            >
+              Switch Audio ({selectedIdx + 1}/{passages.length})
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setPhase('listen')}
-            className={`px-3 py-1.5 text-xs font-bold rounded-lg ${
+            className={`px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer ${
               phase === 'listen' ? 'bg-accent-600 text-white' : 'bg-slate-100 text-slate-600'
             }`}
           >
@@ -92,13 +116,14 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
           <button
             type="button"
             onClick={() => {
+              if (audioRef.current) audioRef.current.pause();
               if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
                 window.speechSynthesis.cancel();
               }
               setIsPlaying(false);
               setPhase('reconstruct');
             }}
-            className={`px-3 py-1.5 text-xs font-bold rounded-lg ${
+            className={`px-3 py-1.5 text-xs font-bold rounded-lg cursor-pointer ${
               phase === 'reconstruct' ? 'bg-primary-600 text-white' : 'bg-slate-100 text-slate-600'
             }`}
           >
@@ -107,11 +132,25 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
         </div>
       </div>
 
+      {humanAudioUrl && (
+        <audio
+          ref={audioRef}
+          src={humanAudioUrl}
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+          onEnded={() => {
+            setIsPlaying(false);
+            setPlayCount((c) => c + 1);
+          }}
+          className="hidden"
+        />
+      )}
+
       {phase === 'listen' ? (
         <div className="bg-accent-50 border border-accent-200 rounded-xl p-6 space-y-4">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold text-accent-800">
-              Audio Listens Used: {playCount} / 2 (Passage text is hidden to train working memory)
+              Audio Listens Used: {playCount} / 2 (Transcript hidden to train working memory)
             </span>
             <button
               type="button"
@@ -119,7 +158,11 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
               disabled={isPlaying}
               className="px-5 py-2.5 bg-accent-600 hover:bg-accent-700 text-white text-xs font-bold rounded-xl disabled:opacity-50 cursor-pointer"
             >
-              {isPlaying ? 'Playing Lecture Audio...' : playCount === 0 ? 'Play Passage (1st Listen)' : 'Play Again (Note-Taking Listen)'}
+              {isPlaying
+                ? 'Playing Human Lecture Audio...'
+                : playCount === 0
+                ? '▶ Play Human Audio (1st Listen: Comprehension)'
+                : '▶ Play Again (2nd Listen: Fragment Note-Taking)'}
             </button>
           </div>
 
@@ -135,7 +178,7 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
               className="w-full px-3.5 py-2.5 bg-white border border-accent-300 rounded-lg text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-accent-500"
             />
             <div className="flex justify-between mt-1 text-[11px] text-slate-500">
-              <span>Compress clauses into 2–4 word fragments</span>
+              <span>Compress spoken clauses into 2–4 word fragments</span>
               <span>{fragmentWordCount} / 25 fragment words</span>
             </div>
           </div>
@@ -143,10 +186,13 @@ export function DictoglossBlock({ block }: { block: BlockConfig }) {
           <div className="flex justify-end">
             <button
               type="button"
-              onClick={() => setPhase('reconstruct')}
+              onClick={() => {
+                if (audioRef.current) audioRef.current.pause();
+                setPhase('reconstruct');
+              }}
               className="px-4 py-2 bg-primary-600 text-white text-xs font-bold rounded-lg hover:bg-primary-700 cursor-pointer"
             >
-              Lock Audio &amp; Start Reconstruction →
+              Lock Audio & Start Reconstruction →
             </button>
           </div>
         </div>

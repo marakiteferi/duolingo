@@ -56,6 +56,7 @@ export interface QuestionBankItem {
   sampleAnswer?: string;
   targetChunks?: string[];
   sourceAudioText?: string;
+  audioUrl?: string;
   difficulty: number | 'easy' | 'mid' | 'hard';
   tags: string[];
   srs?: SRSData;
